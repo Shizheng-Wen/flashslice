@@ -12,7 +12,7 @@ import torch
 
 pytest.importorskip("triton")
 
-from flashslice.kernels.fused_slice import unsupported_dims  # noqa: E402
+from flashslice.kernels.slice_ops import unsupported_dims  # noqa: E402
 from flashslice.layers.physics_attention import (  # noqa: E402
     Physics_Attention_Irregular_Mesh,
 )

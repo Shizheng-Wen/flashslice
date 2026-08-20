@@ -42,7 +42,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
             # eager path instead of failing the run. The fallback is loud and
             # is recorded in self.fused_slice_fallback / self.use_fused_slice,
             # so an inert flag stays visible on the built model.
-            from ..kernels.fused_slice import unsupported_dims
+            from ..kernels.slice_ops import unsupported_dims
             why = unsupported_dims(dim_head, slice_num)
             if why:
                 warn = logger.warning
@@ -89,7 +89,7 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         eager path; w (B,H,N,G) is never materialized and the backward
         recomputes it, so the permute/contiguous copies and the stored
         slice-weight activations disappear."""
-        from ..kernels.fused_slice import fused_slice, fused_deslice
+        from ..kernels.slice_ops import fused_slice, fused_deslice
         B, N, C = x.shape
         H, D = self.heads, self.dim_head
 

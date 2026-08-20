@@ -120,7 +120,7 @@ def run_bf16_case(name, dot, B=1, N=86840, dim=256, heads=8, dim_head=32,
     the fp64 reference. Everything here is bf16-class noise; the gate asks
     the fused error to stay within 2x of eager's (same class), plus bitwise
     determinism across two fused runs."""
-    from flashslice.kernels import fused_slice as fs
+    from flashslice.kernels import slice_ops as fs
     print("case: {} (bf16 autocast, dot={})".format(name, dot), flush=True)
     torch.manual_seed(7)
     base = Physics_Attention_Irregular_Mesh(
@@ -182,7 +182,7 @@ def main():
     # is measurably noisier than eager here by design (~3-4x, still ~5x below
     # the bf16 class); the gate only asserts the order of magnitude.
     torch.backends.cuda.matmul.allow_tf32 = True
-    from flashslice.kernels import fused_slice as _fs
+    from flashslice.kernels import slice_ops as _fs
     _fs.set_dot_mode("tf32")
     run_case("tf32-optin", B=1, N=86840, gate=10.0)
     _fs.set_dot_mode("")

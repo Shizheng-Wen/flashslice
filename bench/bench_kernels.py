@@ -21,7 +21,7 @@ import statistics
 import torch
 import triton
 
-from flashslice.kernels import fused_slice as fs
+from flashslice.kernels import slice_ops as fs
 
 # logical (N,H,D)-sized tensors touched / tl.dot calls, per kernel
 _NBYTES = {"slice_fwd": 2, "deslice_fwd": 2, "slice_bwd": 4, "deslice_bwd": 3}
