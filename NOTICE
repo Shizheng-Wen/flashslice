@@ -1,5 +1,5 @@
 FlashSlice
-Copyright 2026 The FlashSlice Authors
+Copyright 2026 Shizheng Wen @ ETH Zurich
 
 This product is licensed under the Apache License, Version 2.0 (see LICENSE).
 
@@ -49,4 +49,4 @@ license requires:
 
 LinearNO (Hu et al., AAAI 2026) is NOT included in this repository. The paper
 compares against it; anyone reproducing that comparison should use the authors'
-own release at https://github.com/HiPRL/LinearNO.
+own release at https://github.com/HiP

@@ -1,4 +1,4 @@
-# Copyright 2026 The FlashSlice Authors
+# Copyright 2026 Shizheng Wen
 # SPDX-License-Identifier: Apache-2.0
 
 """Fused Triton kernels for Transolver's slice/deslice pipeline ("FlashSlice").

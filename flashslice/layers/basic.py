@@ -1,4 +1,4 @@
-# Copyright 2026 The FlashSlice Authors
+# Copyright 2026 Shizheng Wen
 # SPDX-License-Identifier: Apache-2.0
 #
 # Portions of this file derive from Transolver (https://github.com/thuml/Transolver),
