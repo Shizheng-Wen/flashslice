@@ -60,21 +60,38 @@ slice/deslice rather than to softmax attention.
 It is an implementation switch, not a model change: outputs match the eager path
 and checkpoints interchange in both directions.
 
-Measured against eager PyTorch on one GH200, at the paper's configuration:
+Measured against eager PyTorch on one GH200, in the configuration every
+experiment in the paper runs in — eager, no compilation, no activation
+checkpointing:
 
-|                      | speedup            | memory      |
-| -------------------- | ------------------ | ----------- |
-| training step, fp32  | 1.35×              | −14–25%     |
-| training step, bf16  | 1.53–1.70×         | −14–25%     |
-| inference            | 1.52–1.68×         | −20–26%     |
+| | *N* | eager | ours | speedup | eager mem | ours mem | saved |
+| --- | --- | --- | --- | --- | --- | --- | --- |
+| **training step** (fwd + bwd) | | | | | | | |
+| fp32 | 262k | 171 ms | 126 ms | **1.35×** | 28.0 GB | 24.0 GB | 14% |
+| bf16 | 262k | 143 ms | 93.1 ms | **1.53×** | 20.4 GB | 15.4 GB | 24% |
+| bf16 | 1M | 585 ms | 345 ms | **1.70×** | 81.3 GB | 61.3 GB | 25% |
+| **inference** (fwd only) | | | | | | | |
+| fp32 | 1M | 229 ms | 138 ms | **1.66×** | 10.1 GB | 8.1 GB | 20% |
+| fp32 | 8.4M | 1944 ms | 1160 ms | **1.68×** | 80.5 GB | 64.5 GB | 20% |
+| bf16 | 1M | 174 ms | 113 ms | **1.53×** | 7.6 GB | 5.6 GB | 26% |
+| bf16 | 8.4M | 1420 ms | 932 ms | **1.52×** | 60.5 GB | 44.5 GB | 26% |
+| bf16 | 12.6M | OOM | 1411 ms | — | — | 66.7 GB | — |
 
-And it changes how the layer scales, which matters more than the constant:
+The constant factor is not the interesting part. What changes is how the layer
+*scales*:
 
-- **Memory is flat in `G`.** From `G=16` to `G=128` the fused layer moves
-  15.42 → 15.43 GB; eager goes 17.92 → 36.89 GB. The tensor that is never
-  written is the only per-layer term that grows with the slice count.
-- **Depth reaches further.** At a 95 GB budget, 32 layers where eager fits 16
-  (fp32), 48 where eager fits 32 (bf16).
+![Memory and time against slice count and depth](assets/F4_systems.png)
+
+- **Memory is flat in the slice count.** From `G=16` to `G=128` the fused layer
+  moves 15.42 → 15.43 GB while eager goes 17.92 → 36.89 GB (bf16). The tensor
+  that is never written is the only per-layer term that grows with `G`, so
+  raising it is free for us and linear for eager.
+- **Depth reaches further.** At a 95 GB budget: 32 layers where eager fits 16
+  (fp32), 48 where eager fits 32 (bf16). The two compound — at `G=128` eager
+  stops at 16 layers in both precisions while we reach 32 (fp32) and 48 (bf16).
+
+Reproduce with `bench/bench_kernels.py`; the caveats that cost us time are in
+`bench/README.md`.
 
 ### Supported shapes
 
@@ -106,6 +123,47 @@ set at a time:
 together with `share_slice_across_layers` and `slice_once`: both consume the
 slice weights the kernel deliberately never materializes, so they raise at
 construction rather than quietly producing a different model.
+
+## What the paper found
+
+The kernel exists because of a claim about what the layer is doing. The claim is
+that the load-bearing structure is the *coupling* — alternating full-resolution
+pointwise MLPs with the slice/deslice bottleneck — and not the self-attention
+among slice tokens.
+
+![Ablation ratios across eight benchmarks](assets/F1_money.png)
+
+Best validation relative L¹ across eight benchmarks in fluid dynamics and
+industrial aerodynamics, up to 1.4×10⁸ mesh points. Three seeds for the first
+two columns, one seed otherwise; **bold** is the best per row.
+
+| Dataset | Baseline | NoTokenAttn | MlpOnly | Untied | FrozenSlice | SliceOnce |
+| --- | --- | --- | --- | --- | --- | --- |
+| Taylor–Green | 0.0756 ±.0001 | **0.0745** ±.0001 | 0.0786 | 0.0755 | 0.0777 | 0.188 |
+| SHIFT-Wing surface | 0.0580 ±.0005 | 0.0579 ±.0005 | 0.139 | **0.0576** | 0.0577 | 0.155 |
+| DrivAerNet++ surface | 0.193 ±.005 | **0.188** ±.002 | 0.294 | 0.190 | 0.192 | 0.435 |
+| DrivAerNet++ volume | 0.1625 ±.0003 | **0.159** ±.001 | 0.315 | 0.162 | 0.162 | 0.386 |
+| SHIFT-SUV surface | 0.15654 ±.00074 | 0.15738 ±.00003 | 0.252 | **0.15575** | 0.15923 | 0.449 |
+| SHIFT-SUV volume | 0.06010 ±.00056 | 0.06238 ±.00086 | 0.197 | **0.05773** | 0.06834 | 0.408 |
+| DrivAerML surface | 0.089 ±.001 | 0.096 ±.000 | 0.501 | **0.086** | 0.104 | 0.579 |
+| DrivAerML volume | 0.110 ±.005 | 0.112 ±.004 | 0.497 | **0.108** | 0.123 | 0.745 |
+
+Reading it:
+
+- **`no_token_attention` costs nothing** — −2.6% to +1.8% on six benchmarks,
+  +3.8% and +7.9% on the other two. Replacing the content-dependent attention
+  core with a constant learned matrix is free, and on several benchmarks it is
+  the best variant.
+- **The coupling is not optional.** `mlp_only` — the same model with the whole
+  attention sublayer removed — loses 1.04× to 5.6×, and widening it to 112% of
+  the baseline's parameters still leaves it 1.6–1.9× short. That is an
+  expressivity limit, not a capacity one.
+- **Nor is the point stream.** `slice_once` keeps the attention and *more*
+  parameters than the baseline but collapses the points into token space; it is
+  the worst variant on every benchmark (2.2×–6.8×).
+
+Which is why the kernel targets slice/deslice: it is the part that turned out to
+matter, and it was the part that dominated memory.
 
 ## Tests and benchmarks
 
