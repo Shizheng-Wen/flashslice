@@ -9,6 +9,9 @@ description = "Fused Triton kernels for the slice/deslice bottleneck of physics-
 readme = "README.md"
 license = "Apache-2.0"
 license-files = ["LICENSE", "NOTICE"]
+authors = [
+    {name = "Shizheng Wen", email = "shizheng.wen@sam.math.ethz.ch"},
+]
 requires-python = ">=3.9"
 dependencies = [
     "torch>=2.4",
