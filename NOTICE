@@ -1,0 +1,52 @@
+FlashSlice
+Copyright 2026 The FlashSlice Authors
+
+This product is licensed under the Apache License, Version 2.0 (see LICENSE).
+
+================================================================================
+Third-party software
+================================================================================
+
+Portions of this software derive from Transolver
+(https://github.com/thuml/Transolver), used under the MIT License. The files
+concerned carry a header saying so; they are:
+
+    flashslice/layers/physics_attention.py   the physics-attention layer
+                                             (ablation flags and the fused path
+                                             are additions)
+    flashslice/layers/basic.py               the pointwise MLP
+    flashslice/models/transolver.py          the block and backbone structure
+
+The Triton kernels in flashslice/kernels/ are original work and do not derive
+from Transolver.
+
+The MIT License notice for the derived portions, reproduced in full as that
+license requires:
+
+    MIT License
+
+    Copyright (c) 2024 THUML @ Tsinghua University
+
+    Permission is hereby granted, free of charge, to any person obtaining a copy
+    of this software and associated documentation files (the "Software"), to deal
+    in the Software without restriction, including without limitation the rights
+    to use, copy, modify, merge, publish, distribute, sublicense, and/or sell
+    copies of the Software, and to permit persons to whom the Software is
+    furnished to do so, subject to the following conditions:
+
+    The above copyright notice and this permission notice shall be included in all
+    copies or substantial portions of the Software.
+
+    THE SOFTWARE IS PROVIDED "AS IS", WITHOUT WARRANTY OF ANY KIND, EXPRESS OR
+    IMPLIED, INCLUDING BUT NOT LIMITED TO THE WARRANTIES OF MERCHANTABILITY,
+    FITNESS FOR A PARTICULAR PURPOSE AND NONINFRINGEMENT. IN NO EVENT SHALL THE
+    AUTHORS OR COPYRIGHT HOLDERS BE LIABLE FOR ANY CLAIM, DAMAGES OR OTHER
+    LIABILITY, WHETHER IN AN ACTION OF CONTRACT, TORT OR OTHERWISE, ARISING FROM,
+    OUT OF OR IN CONNECTION WITH THE SOFTWARE OR THE USE OR OTHER DEALINGS IN THE
+    SOFTWARE.
+
+================================================================================
+
+LinearNO (Hu et al., AAAI 2026) is NOT included in this repository. The paper
+compares against it; anyone reproducing that comparison should use the authors'
+own release at https://github.com/HiPRL/LinearNO.

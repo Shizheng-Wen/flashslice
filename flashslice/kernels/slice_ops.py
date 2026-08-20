@@ -1,3 +1,6 @@
+# Copyright 2026 The FlashSlice Authors
+# SPDX-License-Identifier: Apache-2.0
+
 """Fused Triton kernels for Transolver's slice/deslice pipeline ("FlashSlice").
 
 Replaces the bandwidth-bound middle of ``Physics_Attention_Irregular_Mesh``

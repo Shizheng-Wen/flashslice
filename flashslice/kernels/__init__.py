@@ -1,3 +1,6 @@
+# Copyright 2026 The FlashSlice Authors
+# SPDX-License-Identifier: Apache-2.0
+
 """Fused Triton kernels for the slice/deslice bottleneck.
 
 ``fused_slice`` and ``fused_deslice`` are registered ``torch.library`` custom

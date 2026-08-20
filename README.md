@@ -178,16 +178,19 @@ fused for the forward, the training step, and inference, and sweeps the tile
 configurations. `bench/parity_test.py` checks that the fused path matches eager
 to the precision class of its dot mode, against an fp64 reference.
 
-## Attribution
+## License and attribution
 
-The Transolver layer and backbone derive from the reference implementation of
-Transolver (Wu et al.); the ablation flags, the fused kernels, and the
-instrumentation are ours. If you compare against LinearNO (Hu et al., AAAI
-2026), please use their own release at
-<https://github.com/HiPRL/LinearNO> rather than a reimplementation.
+Apache License 2.0 — see [`LICENSE`](LICENSE).
 
-> **TODO before making this public: add a `LICENSE`.** The code derives from
-> Transolver's release, so check its terms and keep them compatible.
+The physics-attention layer, the MLP and the block/backbone structure derive
+from [Transolver](https://github.com/thuml/Transolver) (Copyright (c) 2024
+THUML @ Tsinghua University), used under the MIT License. Those files carry a
+header saying so and [`NOTICE`](NOTICE) reproduces the MIT notice in full, as
+that license requires. The Triton kernels, the ablation flags and the
+instrumentation are original work.
+
+LinearNO (Hu et al., AAAI 2026) is not vendored here. The paper compares against
+it; use the authors' own release at <https://github.com/HiPRL/LinearNO>.
 
 ## Citation
 

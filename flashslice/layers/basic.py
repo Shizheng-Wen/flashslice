@@ -1,3 +1,10 @@
+# Copyright 2026 The FlashSlice Authors
+# SPDX-License-Identifier: Apache-2.0
+#
+# Portions of this file derive from Transolver (https://github.com/thuml/Transolver),
+# Copyright (c) 2024 THUML @ Tsinghua University, used under the MIT License.
+# The full MIT notice is reproduced in the NOTICE file at the repository root.
+
 """The pointwise MLP used by every Transolver block.
 
 Taken unchanged from the reference implementation. The upstream file also
