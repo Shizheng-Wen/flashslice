@@ -42,13 +42,14 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         self.use_fused_slice = use_fused_slice
         self.fused_slice_fallback = None
         if use_fused_slice:
-            # Decide at construction, not mid-training. The kernels tile the
-            # whole D and G axes, so both must be powers of two in [16, 128]
-            # (see fused_slice.unsupported_dims). Outside that range — e.g. the
-            # G=8 / G=256 ends of the slice-count sweep — this layer runs the
-            # eager path instead of failing the run. The fallback is loud and
-            # is recorded in self.fused_slice_fallback / self.use_fused_slice,
-            # so an inert flag stays visible on the built model.
+            # Decide at construction, not mid-training. The single-tile
+            # kernels serve D and G that are powers of two in [16, 128]; the
+            # G-blocked kernels serve any other G and D up to 256 (see
+            # slice_ops.unsupported_dims). Only D beyond that is refused, and
+            # then this layer runs the eager path instead of failing the run.
+            # The fallback is loud and is recorded in
+            # self.fused_slice_fallback / self.use_fused_slice, so an inert
+            # flag stays visible on the built model.
             from ..kernels.slice_ops import unsupported_dims
             why = unsupported_dims(dim_head, slice_num)
             if why:
@@ -92,10 +93,10 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         )
 
     def _forward_fused(self, x):
-        """Fused slice/deslice (see layers/fused_slice.py). Same math as the
-        eager path; w (B,H,N,G) is never materialized and the backward
-        recomputes it, so the permute/contiguous copies and the stored
-        slice-weight activations disappear."""
+        """Fused slice/deslice (see kernels/slice_ops.py and kernels/blocked.py).
+        Same math as the eager path; w (B,H,N,G) is never materialized and
+        the backward recomputes it, so the permute/contiguous copies and the
+        stored slice-weight activations disappear."""
         from ..kernels.slice_ops import fused_slice, fused_deslice
         B, N, C = x.shape
         H, D = self.heads, self.dim_head
@@ -103,8 +104,11 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
         fx_mid = self.in_project_fx(x).view(B, N, H, D)
         x_mid = self.in_project_x(x).view(B, N, H, D)
         tau = self.temperature.view(H)
-        z_num, s = fused_slice(x_mid, fx_mid, self.in_project_slice.weight,
-                               self.in_project_slice.bias, tau)
+        # stats: the per-point softmax statistics of the blocked path (None
+        # on the single-tile path). Tied deslice reuses them; untied recomputes.
+        z_num, s, stats = fused_slice(x_mid, fx_mid, self.in_project_slice.weight,
+                                      self.in_project_slice.bias, tau,
+                                      return_stats=True)
         slice_token = z_num / (s + 1e-5).unsqueeze(-1)  # B H G dim_head
 
         ### (2) Attention among slice tokens — unchanged, tiny (G tokens)
@@ -126,7 +130,8 @@ class Physics_Attention_Irregular_Mesh(nn.Module):
                                   self.deslice_temperature.view(H), out_slice_token)
         else:
             out_x = fused_deslice(x_mid, self.in_project_slice.weight,
-                                  self.in_project_slice.bias, tau, out_slice_token)
+                                  self.in_project_slice.bias, tau, out_slice_token,
+                                  stats=stats)
         # out_x is (B, N, H, D) already — reshape is a view, no copy.
         return self.to_out(out_x.reshape(B, N, H * D)), None
 

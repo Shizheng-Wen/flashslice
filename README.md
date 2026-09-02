@@ -21,8 +21,18 @@ pip install -e .
 ```
 
 Requires PyTorch and Triton. Developed and measured against torch 2.5 / Triton
-3.0 on NVIDIA GH200 (Hopper). The kernels use Hopper tensor-core paths; other
-architectures are untested.
+3.0 on NVIDIA GH200 (Hopper); every number below is from that GPU.
+
+Other GPUs are untested. Nothing in the kernels is Hopper-specific — the
+`tf32` and `bf16` dot modes need Ampere-class tensor cores or newer, the
+default `ieee` mode needs none — but the tile tables were swept on Hopper's
+227 KB of shared memory per block, and entries with `num_stages=3` or
+`BLOCK_N=256` can exceed the 100 KB of an Ada part such as the RTX 4090.
+That fails at compile time with a Triton resource error, not silently; the
+fix is a sweep on the target GPU (`bench/bench_kernels.py` for both kernel
+families, then `bench/pick_tiles.py` for the blocked one) and new table
+entries. Memory use does not depend on the GPU, so the sizes in the tables
+below transfer as they are.
 
 ## Quick start
 
@@ -46,7 +56,31 @@ The kernels are usable on their own:
 
 ```python
 from flashslice.kernels import fused_slice, fused_deslice, unsupported_dims
+
+z_num, s, stats = fused_slice(x_mid, fx_mid, W, b, tau, return_stats=True)
+out = fused_deslice(x_mid, W, b, tau, tokens, stats=stats)   # stats optional
 ```
+
+### Precision
+
+Inputs are fp32, or bf16 under `torch.autocast`; those two are what the
+parity gate covers (fp16 takes the same 16-bit path but is untested).
+Parameters stay fp32, and accumulation is fp32 in every mode. What varies
+is the precision of the dots, chosen with `set_dot_mode(...)` or the
+`FLASHSLICE_DOT_MODE` environment variable:
+
+| mode | dots | error against fp64 | use it for |
+| --- | --- | --- | --- |
+| `ieee` (default) | all fp32, on the FMA units | eager fp32's own | the paper's shapes; anything that must match eager |
+| `tf32` | value dots on tensor cores, logits fp32 | ~5e-4 on outputs | fp32 inputs at large `G` |
+| `bf16v` | value dots bf16, logits fp32 (16-bit inputs) | between the two | — |
+| `bf16` | all dots bf16 (16-bit inputs) | eager bf16 autocast's own | bf16 training at large `G` |
+
+The logits dot stays fp32 below the `bf16` level because the softmax
+Jacobian amplifies noise in the slice weights. At the single-tile shapes the
+default is also the fast choice; at large `G` the kernels are bound by dot
+throughput and a tensor-core mode is what makes them faster than eager (see
+the blocked table below).
 
 ## What the kernel does
 
@@ -95,16 +129,90 @@ Reproduce with `bench/bench_kernels.py`; the caveats that cost us time are in
 
 ### Supported shapes
 
-The kernels hold the whole head width `D` and the slice count `G` in one tile,
-so both must be powers of two in `[16, 128]`. Outside that range the layer
-**falls back to the eager path and says so** — it logs a warning, sets
-`use_fused_slice = False` on the built model, and records the reason in
-`fused_slice_fallback`. A flag that is silently inert trains a baseline replica
-and looks like a result; this one cannot.
+Two kernel families sit behind `use_fused_slice`, and the layer picks by
+shape:
 
-Tile configurations are tuned per `G`. Using the `G=32` table at `G=128` costs
-up to 40–80× through register spilling, so the tables are keyed by `G` rather
-than shared.
+- **Single-tile kernels** hold the whole head width `D` and slice count `G`
+  in one tile, so the softmax over `G` never leaves registers. They serve `D`
+  and `G` that are powers of two in `[16, 128]`, and they are the kernels
+  every number above was measured with. Tile configurations are tuned per
+  `G`: using the `G=32` table at `G=128` costs up to 40–80× through register
+  spilling, so the tables are keyed by `G` rather than shared.
+- **G-blocked kernels** serve every other shape: any `G` — the last block is
+  masked, so `G=8`, `G=48` and `G=512` all run — and any `D` up to 256,
+  padded to a power of two. They take the approach of FlashAttention's
+  *backward* rather than its forward. A small pass saves the per-point
+  softmax statistics of the slice logits — row max and sum of exponentials,
+  two floats per point and head, 2/`G` of `w` — and every kernel then
+  recomputes `w = exp(logit − m) / l` one `G`-block at a time.
+  FlashAttention's online softmax rescales an accumulator indexed by the
+  softmax's own row; deslice has that shape, but slice is its transpose —
+  accumulators per token, summed over points — and the saved-statistics
+  form is the one that serves both. Tokens, `dW` and `db` come from programs that
+  own a `G`-block and stream over `N`; `out`, `dxm` and `dfx` from programs
+  that own an `N`-block and stream over `G`. Still no atomics, still bitwise
+  deterministic, held to the same parity gate. The price is one extra read
+  of `x_mid` in the forward and one more logits recompute in the backward,
+  which is why routing prefers the single-tile kernels wherever they apply.
+  `set_kernel_mode("blocked")` (or `FLASHSLICE_KERNEL_MODE=blocked`) forces
+  them, for timing and parity runs; `set_block_g` overrides the block size.
+
+Only `D > 256` is outside both. There the layer **falls back to the eager
+path and says so** — it logs a warning, sets `use_fused_slice = False` on the
+built model, and records the reason in `fused_slice_fallback`. A flag that is
+silently inert trains a baseline replica and looks like a result; this one
+cannot.
+
+### The blocked kernels, measured
+
+One layer (`Physics_Attention_Irregular_Mesh`, `H=8`, `D=32`), training step
+unless marked, eager against fused on one GH200, medians of ten. The dot
+mode is the `set_dot_mode` setting: `ieee` is the default, `bf16` needs
+16-bit inputs.
+
+| inputs / dots | *G* | *N* | eager | ours | speedup | eager mem | ours mem | saved |
+| --- | --- | --- | --- | --- | --- | --- | --- | --- |
+| bf16 / bf16 | 256 | 262k | 47.5 ms | 11.9 ms | **3.98×** | 13.7 GB | 2.0 GB | 85% |
+| bf16 / bf16 | 256 | 1M | 293.7 ms | 45.5 ms | **6.45×** | 54.5 GB | 8.1 GB | 85% |
+| bf16 / bf16 | 512 | 262k | 90.6 ms | 20.0 ms | **4.53×** | 26.7 GB | 2.0 GB | 92% |
+| bf16 / bf16 | 512 | 1M | OOM | 80.3 ms | — | — | 8.1 GB | — |
+| bf16 / bf16 | 1024 | 262k | 180.2 ms | 37.6 ms | **4.79×** | 52.7 GB | 2.1 GB | 96% |
+| bf16 / bf16, inference | 256 | 1M | 39.4 ms | 13.3 ms | **2.96×** | 17.0 GB | 2.1 GB | 88% |
+| bf16 / bf16, inference | 256 | 4.2M | 157.3 ms | 53.2 ms | **2.95×** | 68.0 GB | 8.3 GB | 88% |
+| bf16 / bf16 | 48 | 262k | 13.0 ms | 6.1 ms | **2.12×** | 3.1 GB | 2.0 GB | 35% |
+| fp32 / tf32 | 256 | 262k | 45.1 ms | 40.5 ms | 1.11× | 14.8 GB | 2.0 GB | 86% |
+| fp32 / ieee | 256 | 262k | 45.1 ms | 53.2 ms | 0.85× | 14.8 GB | 2.0 GB | 86% |
+| bf16 / tf32 | 256 | 262k | 47.5 ms | 40.0 ms | 1.19× | 13.7 GB | 2.0 GB | 85% |
+| bf16 / ieee | 256 | 262k | 47.4 ms | 64.0 ms | 0.74× | 13.7 GB | 2.0 GB | 85% |
+| bf16 / ieee | 256 | 1M | 294.3 ms | 253.4 ms | 1.16× | 54.5 GB | 8.1 GB | 85% |
+
+Reading it:
+
+- **Memory behaves as at small `G`**: the fused layer sits at 2 GB whether
+  `G` is 48 or 1024, while eager grows linearly and runs out at
+  `G=512, N=1M`.
+- **Sizing.** Fused memory scales with `B·N` and with the layer count, not
+  with `G`: about 8 GB per million points per layer for a bf16 training
+  step and 2 GB per million for inference (`H=8`, `D=32`); the model-level
+  table above (8 layers, `G=32`) is the same arithmetic. By it, a 24 GB card
+  trains the 8-layer bf16 model at roughly 350k points and runs inference
+  near 4M — an extrapolation, not a measurement.
+- **Time is a dot-throughput question.** Slice/deslice cost `O(N·G·D)`
+  multiply-adds, and at `G=256` a point does eight times the work it does at
+  `G=32`. Triton's `ieee` fp32 dot is an FMA path at ~15 TFLOP/s on this
+  GPU, so in the default mode the blocked kernels are compute-bound and
+  land around eager's time; on tensor cores (`tf32` for fp32 inputs, `bf16`
+  for 16-bit inputs) they are 3–6× faster than eager. The single-tile
+  kernels at `G=32` are near the memory/compute crossover, which is why the
+  tables above did not need this choice.
+- **Wide heads gain nothing.** At `D=256` the weight tensor is one eighth of
+  the point activations and the blocked layer is 0.79× eager at 4% less
+  memory; the kernels run there, but the bottleneck the paper found is not
+  there.
+- **Forced onto the paper shape** (`G=32`, where routing picks the
+  single-tile kernels), the blocked kernels are 1.12× eager in fp32 against
+  the single-tile 1.72×: the statistics pass and the extra logits recompute
+  in the backward, and nothing else.
 
 ## Ablations
 
@@ -168,15 +276,22 @@ matter, and it was the part that dominated memory.
 ## Tests and benchmarks
 
 ```bash
-pytest tests/                       # dim contract, visible fallback, eager equivalence
-python bench/parity_test.py         # fused vs eager, fp64-referenced
-python bench/bench_kernels.py --help
+pytest tests/                       # dim contract, routing, visible fallback, eager equivalence
+python bench/parity_test.py         # fused vs eager, fp64-referenced, both kernel families
+python bench/bench_layer.py --slices 256 --dtype bf16   # one layer, eager vs fused, any shape
+python bench/bench_kernels.py --defaults-only            # per-kernel time, bandwidth, TFLOP/s
+python bench/bench_kernels.py --family blocked --slices 256   # sweep the blocked kernels
+python bench/pick_tiles.py bench/results/sweep_*.json    # sweep results -> tile table entry
 ```
 
 `bench/bench_kernels.py` reproduces the systems tables: it times eager against
 fused for the forward, the training step, and inference, and sweeps the tile
-configurations. `bench/parity_test.py` checks that the fused path matches eager
-to the precision class of its dot mode, against an fp64 reference.
+configurations of either kernel family. `bench/bench_layer.py` times one
+layer, eager against fused, at any shape, including the ones only the blocked
+kernels serve. `bench/parity_test.py` checks that the fused path matches
+eager to the precision class of its dot mode, against an fp64 reference; the
+`blk-tiny-N17` and `blk-g512` cases are the sensitive ones. The caveats that
+cost us time are in `bench/README.md`.
 
 ## License and attribution
 

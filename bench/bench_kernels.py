@@ -1,15 +1,22 @@
-"""Phase 1.5 micro-tuning sweep for the four fused_slice kernels.
+"""Tile-tuning sweep for the four single-tile kernels in kernels/slice_ops.py.
 
 Direct kernel launches (no autograd) at the paper head width (H=8, D=32),
 sweeping BLOCK_N x num_warps x num_stages x dot precision (ieee/tf32/bf16)
 per kernel, reporting time, achieved GB/s (logical N*H*D tensor traffic)
-and TFLOP/s. The winners get hardcoded into fused_slice._CFG.
+and TFLOP/s. The winners get hardcoded into slice_ops._CFG.
 
 --slices selects G, the slice count: the kernels hold the whole G axis in
 one tile, so the tile budget is BLOCK_N x G and the winner moves with G.
-_CFG is keyed by G for exactly the supported set {16, 32, 64, 128}
-(fused_slice._check_dims), one sweep job per value.
-Run via kernel_bench.sbatch.
+_CFG is keyed by G for exactly the single-tile set {16, 32, 64, 128}
+(slice_ops.single_tile_dims), one sweep job per value.
+
+--family blocked sweeps the seven G-blocked kernels of kernels/blocked.py
+instead, at the G given by --slices (any value; the block size comes from
+blocked.tiles, or --block-g). They borrow the single-tile tables keyed by
+their block size (blocked._FAMILY), so this is how to check that borrowing
+and find their own winners. For layer-level numbers at any shape see
+bench_layer.py.
+GPU required.
 """
 
 import argparse
@@ -21,11 +28,20 @@ import statistics
 import torch
 import triton
 
+from flashslice.kernels import blocked as fb
 from flashslice.kernels import slice_ops as fs
 
 # logical (N,H,D)-sized tensors touched / tl.dot calls, per kernel
 _NBYTES = {"slice_fwd": 2, "deslice_fwd": 2, "slice_bwd": 4, "deslice_bwd": 3}
 _NDOTS = {"slice_fwd": 2, "deslice_fwd": 2, "slice_bwd": 5, "deslice_bwd": 6}
+# the G-blocked family: dots counted per full G (each G-block contributes
+# GB/G of one), so TFLOP/s stay comparable with the single-tile numbers
+_NBYTES_BLK = {"stats": 1, "slice_fwd_g": 2, "deslice_fwd_n": 2,
+               "slice_bwd_n": 4, "slice_bwd_g": 2, "deslice_bwd_n": 3,
+               "deslice_bwd_g": 2}
+_NDOTS_BLK = {"stats": 1, "slice_fwd_g": 2, "deslice_fwd_n": 2,
+              "slice_bwd_n": 6, "slice_bwd_g": 3, "deslice_bwd_n": 5,
+              "deslice_bwd_g": 4}
 
 
 def copy_bw():
@@ -57,7 +73,8 @@ def main():
     p.add_argument("--ns", default="262144,1048576,4194304")
     p.add_argument("--dtypes", default="fp32,bf16")
     p.add_argument("--out",
-                   default="scripts/kernel_study/results/phase15_kernels.json")
+                   default=os.path.join(os.path.dirname(os.path.abspath(__file__)),
+                                        "results", "kernels.json"))
     p.add_argument("--defaults-only", action="store_true",
                    help="time only the production _CFG configs (P2 table)")
     p.add_argument("--slices", type=int, default=32, help="G (slice count)")
@@ -70,7 +87,21 @@ def main():
                    help="print every config before launching it (locates "
                         "uncatchable Triton aborts)")
     p.add_argument("--dim-head", type=int, default=32, help="D (head width)")
+    p.add_argument("--family", choices=("single", "blocked"), default="single",
+                   help="single-tile kernels (slice_ops) or the G-blocked "
+                        "ones (blocked)")
+    p.add_argument("--block-g", type=int, default=None,
+                   help="G-block size for --family blocked (default: "
+                        "blocked.tiles)")
     a = p.parse_args()
+    if a.family == "blocked":
+        fb.set_block_g(a.block_g)
+        DT, GB = fb.tiles(a.dim_head, a.slices)
+        NGB = triton.cdiv(a.slices, GB)
+        print("blocked family: D_tile={} G_block={} ({} block(s))".format(
+            DT, GB, NGB), flush=True)
+    nbytes = _NBYTES_BLK if a.family == "blocked" else _NBYTES
+    ndots = _NDOTS_BLK if a.family == "blocked" else _NDOTS
     if a.defaults_only:
         a.ref_bw = copy_bw()
         print("D2D copy reference: {:.0f} GB/s (2x bytes / time; "
@@ -100,7 +131,47 @@ def main():
             key0 = "{}::{}".format(N, dt_s)
             results[key0] = {}
 
-            def make_launches(bn, warps, stages, dot):
+            if a.family == "blocked":
+                # statistics and delta as the production path would produce
+                # them, so every kernel times against valid inputs
+                stats = fb.compute_stats(xm, W, bias, tau)
+                delta = torch.empty(B, H, N, device="cuda")
+
+            def make_launches_blocked(bn, warps, stages, dot):
+                P = fs._n_programs(N, B * H * NGB, bn)
+                pz = torch.empty(B * H * P, G, D, device="cuda")
+                ps = torch.empty(B * H * P, G, device="cuda")
+                pdw = torch.empty(B * H * P, G, D, device="cuda")
+                pdb = torch.empty(B * H * P, G, device="cuda")
+                pdt = torch.empty(B * H * triton.cdiv(N, bn), device="cuda")
+                pdtok = torch.empty(B * H * P, G, D, device="cuda")
+                kw = fb._consts(D, G, DT, GB, bn, dot, warps, stages)
+                gn = (triton.cdiv(N, bn), B * H)
+                gg = (NGB, P, B * H)
+                return {
+                    "stats": lambda: fb._stats_kernel[gn](
+                        xm, W, bias, tau, stats, N, G, H, *sx, **kw),
+                    "slice_fwd_g": lambda: fb._slice_fwd_g_kernel[gg](
+                        xm, fx, W, bias, tau, stats, pz, ps, N, G, P, H,
+                        *sx, *sx, **kw),
+                    "deslice_fwd_n": lambda: fb._deslice_fwd_n_kernel[gn](
+                        xm, W, bias, tau, tok, stats, out, N, G, H,
+                        *sx, *so, **kw),
+                    "slice_bwd_n": lambda: fb._slice_bwd_n_kernel[gn](
+                        xm, fx, W, bias, tau, stats, dzn, ds, dxm, dfx, delta,
+                        pdt, N, G, H, *sx, *sx, **kw),
+                    "slice_bwd_g": lambda: fb._slice_bwd_g_kernel[gg](
+                        xm, fx, W, bias, tau, stats, delta, dzn, ds,
+                        pdw, pdb, N, G, P, H, *sx, *sx, **kw),
+                    "deslice_bwd_n": lambda: fb._deslice_bwd_n_kernel[gn](
+                        xm, W, bias, tau, tok, stats, dout, dxm, delta, pdt,
+                        N, G, H, *sx, *so, **kw),
+                    "deslice_bwd_g": lambda: fb._deslice_bwd_g_kernel[gg](
+                        xm, W, bias, tau, tok, stats, delta, dout,
+                        pdtok, pdw, pdb, N, G, P, H, *sx, *so, **kw),
+                }
+
+            def make_launches_single(bn, warps, stages, dot):
                 P = fs._n_programs(N, B * H, bn)
                 pz = torch.empty(B * H * P, G, D, device="cuda")
                 ps = torch.empty(B * H * P, G, device="cuda")
@@ -124,33 +195,45 @@ def main():
                         pdtok, pdw, pdb, pdt, N, P, H, *sx, *so, **kw),
                 }
 
+            make_launches = (make_launches_blocked if a.family == "blocked"
+                             else make_launches_single)
+
+            def default_cfg(kname, dot):
+                if a.family == "blocked":
+                    return fb._launch_cfg(kname, xm, dot, GB, DT)
+                bn, warps, stages = fs._cfg(kname, xm, dot, G, D)
+                if dot == 1 and kname != "deslice_fwd":
+                    stages = 1
+                return bn, warps, stages
+
             if a.defaults_only:
                 # P2 table: production _CFG configs only, every dot mode valid
                 # for the dtype, with theoretical-minimum bytes and % of the
                 # measured copy peak.
                 dlbl = {0: "ieee", 1: "tf32", 2: "bf16v", 3: "bf16"}
                 dots = (0, 1) if dt == torch.float32 else (0, 1, 2, 3)
-                for kname in ("slice_fwd", "deslice_fwd", "slice_bwd",
-                              "deslice_bwd"):
+                for kname in nbytes:
                     for dot in dots:
-                        bn, warps, stages = fs._cfg(kname, xm, dot, G, D)
-                        st = 1 if (dot == 1 and kname != "deslice_fwd") \
-                            else stages
+                        bn, warps, st = default_cfg(kname, dot)
                         ms = timeit(make_launches(bn, warps, st, dot)[kname])
-                        gb = (_NBYTES[kname] * N * H * D * xm.element_size()
+                        gb = (nbytes[kname] * N * H * D * xm.element_size()
                               / 1e9)
                         gbps = gb * 1e3 / ms
                         tag = "{}/{}".format(kname, dlbl[dot])
                         results[key0][tag] = {
                             "ms": ms, "GB": gb, "GBps": gbps,
                             "pct_copy_peak": 100 * gbps / a.ref_bw,
-                            "TFLOPs": _NDOTS[kname] * 2 * N * H * G * D
+                            "TFLOPs": ndots[kname] * 2 * N * H * G * D
                                       / ms / 1e9,
+                            "cfg": [bn, warps, st],
                         }
-                        print("  {:12s} {:4s} N={:>8} {:5s}: {:7.3f} ms  "
+                        print("  {:13s} {:4s} N={:>8} {:5s}: {:7.3f} ms  "
                               "{:6.3f} GB  {:7.0f} GB/s  {:5.1f}% of copy peak"
+                              "  {:6.1f} TFLOP/s  bn{} w{} s{}"
                               .format(kname, dt_s, N, dlbl[dot],
-                                      ms, gb, gbps, 100 * gbps / a.ref_bw),
+                                      ms, gb, gbps, 100 * gbps / a.ref_bw,
+                                      results[key0][tag]["TFLOPs"],
+                                      bn, warps, st),
                               flush=True)
                 continue
 
@@ -165,6 +248,12 @@ def main():
                     if dot == 1 and stages != 1 and kname != "deslice_fwd":
                         # Triton 3.0's loop pipeliner segfaults compiling async
                         # tf32 dots (uncatchable); bf16 dots survive.
+                        continue
+                    if (dot == 3 and warps > 4
+                            and kname in ("slice_bwd_n", "deslice_bwd_n")):
+                        # Triton 3.0 aborts (assert) on an mma -> mma layout
+                        # conversion in the two-pass N-owned backward kernels
+                        # with bf16 dots on 8 warps (blocked._launch_cfg).
                         continue
                     tag = "{}/bn{}w{}s{}/{}".format(
                         kname, bn, warps, stages,
@@ -181,13 +270,14 @@ def main():
                         continue
                     results[key0][tag] = {
                         "ms": ms,
-                        "GBps": _NBYTES[kname] * N * H * D * xm.element_size()
+                        "GBps": nbytes[kname] * N * H * D * xm.element_size()
                                 / ms / 1e6,
-                        "TFLOPs": _NDOTS[kname] * 2 * N * H * G * D / ms / 1e9,
+                        "TFLOPs": ndots[kname] * 2 * N * H * G * D / ms / 1e9,
                     }
                     k = (kname, dt_s, N, dot)
                     if k not in best or ms < best[k][0]:
                         best[k] = (ms, bn, warps, stages)
+                _dump(a, B, H, D, G, results, best)  # survive a later abort
             print("swept {}".format(key0), flush=True)
 
     print("\n===== best per (kernel, dtype, N, precision) =====")
@@ -197,12 +287,19 @@ def main():
               .format(kname, dt_s, N, {0: "ieee", 1: "tf32", 3: "bf16"}[dot],
                       ms, bn, warps, stages), flush=True)
 
-    os.makedirs(os.path.dirname(a.out), exist_ok=True)
-    with open(a.out, "w") as f:
-        json.dump({"dims": {"B": B, "H": H, "D": D, "G": G},
-                   "results": results,
-                   "best": {str(k): v for k, v in best.items()}}, f, indent=1)
+    _dump(a, B, H, D, G, results, best)
     print("wrote {}".format(a.out), flush=True)
+
+
+def _dump(a, B, H, D, G, results, best):
+    os.makedirs(os.path.dirname(a.out), exist_ok=True)
+    blocked = a.family == "blocked"
+    dims = {"B": B, "H": H, "D": D, "G": G, "family": a.family}
+    if blocked:
+        dims["D_tile"], dims["G_block"] = fb.tiles(a.dim_head, a.slices)
+    with open(a.out, "w") as f:
+        json.dump({"dims": dims, "results": results,
+                   "best": {str(k): v for k, v in best.items()}}, f, indent=1)
 
 
 if __name__ == "__main__":

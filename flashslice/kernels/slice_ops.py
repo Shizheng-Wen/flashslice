@@ -21,7 +21,7 @@ Exactness: identical math to the eager module (bias before the temperature
 division, softmax over G, no temperature clamp) with fp32 accumulation.
 Dot precision defaults to ieee fp32, so differences vs eager are fp
 summation-order only (cuBLAS also serves the skinny slice einsums with fp32
-kernels even under ``allow_tf32``). ``CAMELEON_FUSED_SLICE_DOT`` (or
+kernels even under ``allow_tf32``). ``FLASHSLICE_DOT_MODE`` (or
 ``set_dot_mode``) opts into faster tensor-core dots: ``tf32`` (value dots
 tf32, ~5e-4 output noise — between exact fp32 and the bf16 class), ``bf16v``
 (value dots bf16, 16-bit inputs only) or ``bf16`` (all dots bf16 — the same
@@ -31,10 +31,13 @@ ieee because the softmax Jacobian amplifies any noise in w.
 
 Layout: kernels read x_mid / fx_mid in the natural GEMM output layout
 (B, N, H, D) via strides — the eager permute+contiguous copies disappear.
-Constraints: D and G must be powers of two in [16, 128] (paper: D=32, G=32),
-because each axis is held in a single tile. Outside that range
-``Physics_Attention_Irregular_Mesh`` warns and runs the eager path instead
-(``unsupported_dims``); inside it, tiles are tuned per G (``_CFG``).
+Shapes: the kernels in this file hold D and G whole, one tile each, so they
+serve D and G that are powers of two in [16, 128] (paper: D=32, G=32); tiles
+are tuned per G (``_CFG``). Every other shape — any G, D up to 256 — goes to
+the G-blocked kernels in ``blocked.py`` (``_use_blocked`` routes; ``set_kernel_mode``
+or ``FLASHSLICE_KERNEL_MODE`` forces one path). D above 256 is refused by
+``unsupported_dims``, and ``Physics_Attention_Irregular_Mesh`` then warns and
+runs the eager path instead.
 """
 
 import os
@@ -150,7 +153,7 @@ def _cfg(name, t, dot=0, g=32, d=32):
         warps = 4
     return bn, warps, stages
 
-_DOT_ENV = os.environ.get("CAMELEON_FUSED_SLICE_DOT", "").lower()
+_DOT_ENV = os.environ.get("FLASHSLICE_DOT_MODE", "").lower()
 
 # 0=ieee fp32, 1=tf32 value dots, 2=bf16 value dots, 3=all dots bf16.
 # Accumulation is fp32 in every mode. The logits dot (w computation) stays
@@ -160,7 +163,7 @@ _DOT_LEVELS = {"": 0, "ieee": 0, "tf32": 1, "bf16v": 2, "bf16": 3}
 
 def set_dot_mode(mode):
     """'ieee' (default), 'tf32', 'bf16v' or 'bf16' — overrides
-    CAMELEON_FUSED_SLICE_DOT. Explicit opt-in only; not tied to torch's
+    FLASHSLICE_DOT_MODE. Explicit opt-in only; not tied to torch's
     allow_tf32 (cuBLAS serves the skinny eager slice einsums with fp32
     kernels even when that flag is set)."""
     global _DOT_ENV
@@ -174,20 +177,47 @@ def _dot_mode(t):
     return lvl
 
 
+_D_MAX = 256  # D is held whole in every kernel (padded to a power of two)
+
+_KERNEL_MODES = ("auto", "single-tile", "blocked")
+_KERNEL_MODE = os.environ.get("FLASHSLICE_KERNEL_MODE", "").lower() or "auto"
+
+
+def set_kernel_mode(mode):
+    """'auto' (default), 'single-tile' or 'blocked' — overrides
+    FLASHSLICE_KERNEL_MODE. 'auto' takes the single-tile kernels wherever
+    they apply and the blocked ones elsewhere; the other two force a path
+    (for parity and timing runs). 'single-tile' raises on a shape it cannot
+    serve rather than silently switching."""
+    global _KERNEL_MODE
+    if mode not in _KERNEL_MODES:
+        raise ValueError("kernel mode must be one of %s, got %r"
+                         % (_KERNEL_MODES, mode))
+    _KERNEL_MODE = mode
+
+
+def single_tile_dims(d, g):
+    """True when the tuned single-tile kernels serve (D, G): both powers of
+    two in [16, 128]. The blocked kernels serve everything else."""
+    return all(16 <= v <= 128 and (v & (v - 1)) == 0 for v in (d, g))
+
+
 def unsupported_dims(d, g):
     """Why the fused kernels cannot serve these dims, or None if they can.
 
-    Both the head width D and the slice count G are held in a single tile
-    (there is no blocking over either axis — that is what lets the softmax
-    over G stay register-local and avoids FlashAttention's online-softmax
-    bookkeeping), and `tl.dot` needs at least 16 per dimension. So each must
-    be a power of two in [16, 128]. G=8 and G=256 — the ends of the
-    slice-count sweep — fall outside and run on the eager path.
+    Two regimes. The single-tile kernels in this file hold the whole head
+    width D and slice count G in one tile each (that is what lets the softmax
+    over G stay register-local), so they need both to be powers of two in
+    [16, 128]. Every other shape goes to the G-blocked kernels in
+    ``blocked.py``: any G >= 1 (the last block is masked) and any D up to
+    ``_D_MAX`` (padded to a power of two). Only D outside [1, 256] is
+    refused — like FlashAttention, D is never blocked over.
     """
-    for v, name in ((d, "dim_head"), (g, "slice_num")):
-        if v < 16 or v > 128 or (v & (v - 1)) != 0:
-            return ("%s=%d is outside the fused kernels' supported range "
-                    "(powers of two in [16, 128])" % (name, v))
+    if not 1 <= d <= _D_MAX:
+        return ("dim_head=%d is outside the fused kernels' supported range "
+                "[1, %d]" % (d, _D_MAX))
+    if g < 1:
+        return "slice_num=%d is not a positive slice count" % g
     return None
 
 
@@ -195,6 +225,18 @@ def _check_dims(d, g):
     why = unsupported_dims(d, g)
     if why:
         raise ValueError("fused_slice: " + why)
+
+
+def _use_blocked(d, g):
+    """Route a shape: False = the single-tile kernels here, True = blocked."""
+    if _KERNEL_MODE == "blocked":
+        return True
+    if _KERNEL_MODE == "single-tile":
+        if not single_tile_dims(d, g):
+            raise ValueError("kernel mode 'single-tile' cannot serve dim_head=%d, "
+                             "slice_num=%d (powers of two in [16, 128])" % (d, g))
+        return False
+    return not single_tile_dims(d, g)
 
 
 def _n_programs(n, bh, block_n):
@@ -447,7 +489,7 @@ def _deslice_bwd_kernel(
 # enjoys (review P0-b, job 3084499).
 # --------------------------------------------------------------------------- #
 
-_LIB = torch.library.Library("cameleon", "DEF")
+_LIB = torch.library.Library("flashslice", "DEF")
 _LIB.define(
     "flash_slice(Tensor x_mid, Tensor fx_mid, Tensor weight, Tensor bias, "
     "Tensor tau, int dot) -> (Tensor, Tensor)")
@@ -549,7 +591,7 @@ _LIB.impl("flash_deslice", _deslice_impl, "CUDA")
 _LIB.impl("flash_deslice_bwd", _deslice_bwd_impl, "CUDA")
 
 
-@torch.library.register_fake("cameleon::flash_slice")
+@torch.library.register_fake("flashslice::flash_slice")
 def _(x_mid, fx_mid, weight, bias, tau, dot):
     B, N, H, D = x_mid.shape
     G = weight.shape[0]
@@ -557,20 +599,20 @@ def _(x_mid, fx_mid, weight, bias, tau, dot):
             x_mid.new_empty((B, H, G), dtype=torch.float32))
 
 
-@torch.library.register_fake("cameleon::flash_slice_bwd")
+@torch.library.register_fake("flashslice::flash_slice_bwd")
 def _(x_mid, fx_mid, weight, bias, tau, dz_num, ds, dot):
     return (torch.empty_like(x_mid), torch.empty_like(fx_mid),
             torch.empty_like(weight), torch.empty_like(bias),
             torch.empty_like(tau))
 
 
-@torch.library.register_fake("cameleon::flash_deslice")
+@torch.library.register_fake("flashslice::flash_deslice")
 def _(x_mid, weight, bias, tau, tokens, dot):
     B, N, H, D = x_mid.shape
     return x_mid.new_empty((B, N, H, D))
 
 
-@torch.library.register_fake("cameleon::flash_deslice_bwd")
+@torch.library.register_fake("flashslice::flash_deslice_bwd")
 def _(x_mid, weight, bias, tau, tokens, d_out, dot):
     return (torch.empty_like(x_mid), torch.empty_like(tokens),
             torch.empty_like(weight), torch.empty_like(bias),
@@ -588,7 +630,7 @@ def _slice_grad(ctx, dz_num, ds):
     if ds is None:
         ds = torch.zeros(dz_num.shape[:-1], device=dz_num.device,
                          dtype=torch.float32)
-    dxm, dfx, dw, db, dtau = torch.ops.cameleon.flash_slice_bwd(
+    dxm, dfx, dw, db, dtau = torch.ops.flashslice.flash_slice_bwd(
         x_mid, fx_mid, weight, bias, tau, dz_num, ds, ctx.dot)
     return dxm, dfx, dw, db, dtau, None
 
@@ -601,14 +643,14 @@ def _deslice_setup(ctx, inputs, output):
 
 def _deslice_grad(ctx, d_out):
     x_mid, weight, bias, tau, tokens = ctx.saved_tensors
-    dxm, dtok, dw, db, dtau = torch.ops.cameleon.flash_deslice_bwd(
+    dxm, dtok, dw, db, dtau = torch.ops.flashslice.flash_deslice_bwd(
         x_mid, weight, bias, tau, tokens, d_out, ctx.dot)
     return dxm, dw, db, dtau, dtok, None
 
 
-torch.library.register_autograd("cameleon::flash_slice", _slice_grad,
+torch.library.register_autograd("flashslice::flash_slice", _slice_grad,
                                 setup_context=_slice_setup)
-torch.library.register_autograd("cameleon::flash_deslice", _deslice_grad,
+torch.library.register_autograd("flashslice::flash_deslice", _deslice_grad,
                                 setup_context=_deslice_setup)
 
 
@@ -616,18 +658,43 @@ torch.library.register_autograd("cameleon::flash_deslice", _deslice_grad,
 # public API
 # --------------------------------------------------------------------------- #
 
-def fused_slice(x_mid, fx_mid, weight, bias, tau):
+def fused_slice(x_mid, fx_mid, weight, bias, tau, return_stats=False):
     """x_mid, fx_mid: (B, N, H, D); weight: (G, D); bias: (G,); tau: (H,).
     Returns fp32 z_num (B, H, G, D) and s (B, H, G); normalize outside as
-    z = z_num / (s + eps)[..., None]."""
-    _check_dims(x_mid.shape[3], weight.shape[0])
-    return torch.ops.cameleon.flash_slice(x_mid, fx_mid, weight, bias, tau,
-                                          _dot_mode(x_mid))
+    z = z_num / (s + eps)[..., None].
+
+    With ``return_stats=True`` a third value is returned: on the blocked path
+    the per-point softmax statistics of the slice logits — row max and sum of
+    exponentials, (B, H, 2, N) fp32, detached — which ``fused_deslice`` can
+    reuse when it shares the slice weights (the tied case); on the
+    single-tile path, which never forms them, ``None``. Either value is
+    accepted by ``fused_deslice``."""
+    D, G = x_mid.shape[3], weight.shape[0]
+    _check_dims(D, G)
+    dot = _dot_mode(x_mid)
+    if _use_blocked(D, G):
+        z_num, s, stats = torch.ops.flashslice.slice_blk(
+            x_mid, fx_mid, weight, bias, tau, dot)
+        return (z_num, s, stats.detach()) if return_stats else (z_num, s)
+    z_num, s = torch.ops.flashslice.flash_slice(x_mid, fx_mid, weight, bias,
+                                                tau, dot)
+    return (z_num, s, None) if return_stats else (z_num, s)
 
 
-def fused_deslice(x_mid, weight, bias, tau, tokens):
+def fused_deslice(x_mid, weight, bias, tau, tokens, stats=None):
     """tokens: (B, H, G, D) mixed tokens z'. Returns out (B, N, H, D) in
-    x_mid's dtype — already in the layout to_out expects after a reshape."""
-    _check_dims(x_mid.shape[3], weight.shape[0])
-    return torch.ops.cameleon.flash_deslice(x_mid, weight, bias, tau, tokens,
-                                            _dot_mode(x_mid))
+    x_mid's dtype — already in the layout to_out expects after a reshape.
+
+    ``stats`` is what ``fused_slice(..., return_stats=True)`` returned for
+    the *same* x_mid, weight, bias and tau; pass it to skip recomputing it,
+    or leave it None (always None for untied deslice, whose weights differ).
+    The single-tile path ignores it."""
+    D, G = x_mid.shape[3], weight.shape[0]
+    _check_dims(D, G)
+    dot = _dot_mode(x_mid)
+    if _use_blocked(D, G):
+        out, _ = torch.ops.flashslice.deslice_blk(x_mid, weight, bias, tau,
+                                                  tokens, stats, dot)
+        return out
+    return torch.ops.flashslice.flash_deslice(x_mid, weight, bias, tau, tokens,
+                                              dot)

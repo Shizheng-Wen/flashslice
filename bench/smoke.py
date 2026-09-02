@@ -19,13 +19,14 @@ import torch
 
 from flashslice import Transolver
 from flashslice.layers import Physics_Attention_Irregular_Mesh
-from flashslice.kernels import unsupported_dims
+from flashslice.kernels import unsupported_dims, single_tile_dims
 
 N = 60_000
 HEADS, D, G = 8, 32, 32
+G_BLOCKED = 256  # outside the single-tile range: the G-blocked kernels
 
 
-def check_single_layer():
+def check_single_layer(g=G, d=D):
     """One layer, fused vs eager, at a realistic point count.
 
     The gate is deliberately loose, and the reason is worth stating: the
@@ -42,11 +43,11 @@ def check_single_layer():
     value is printed so a real regression is still visible.
     """
     torch.manual_seed(0)
-    dim = HEADS * D
+    dim = HEADS * d
     fused = Physics_Attention_Irregular_Mesh(
-        dim, heads=HEADS, dim_head=D, slice_num=G, use_fused_slice=True).cuda()
+        dim, heads=HEADS, dim_head=d, slice_num=g, use_fused_slice=True).cuda()
     eager = Physics_Attention_Irregular_Mesh(
-        dim, heads=HEADS, dim_head=D, slice_num=G, use_fused_slice=False).cuda()
+        dim, heads=HEADS, dim_head=d, slice_num=g, use_fused_slice=False).cuda()
     eager.load_state_dict(fused.state_dict())
     assert fused.use_fused_slice is True, "flag went inert on a supported shape"
 
@@ -55,7 +56,9 @@ def check_single_layer():
         a = fused(x)[0]
         b = eager(x)[0]
     rel = ((a - b).norm() / b.norm()).item()
-    print("[smoke] single layer, N=%d: relative L2 difference = %.3e" % (N, rel))
+    print("[smoke] single layer, N=%d, G=%d (%s kernels): relative L2 "
+          "difference = %.3e" % (N, g, "single-tile" if single_tile_dims(d, g)
+                                  else "blocked", rel))
     assert rel < 1e-2, ("fused and eager disagree by far more than fp32 "
                        "accumulation can explain -- this is a wiring bug, "
                        "not precision")
@@ -79,18 +82,20 @@ def check_model_and_backward():
 
 
 def check_fallback_is_visible():
-    """An unsupported G must degrade loudly, never silently."""
-    small = Transolver(space_dim=3, fun_dim=1, out_dim=4, n_hidden=HEADS * D,
-                       n_heads=HEADS, n_layers=2, slice_num=8, use_fused_slice=True)
-    assert small.use_fused_slice is False, "inert flag on an unsupported shape"
-    print("[smoke] G=8 -> unsupported_dims says %r, model reports use_fused_slice=%s"
-          % (unsupported_dims(D, 8), small.use_fused_slice))
+    """An unsupported D must degrade loudly, never silently."""
+    wide = Transolver(space_dim=3, fun_dim=1, out_dim=4, n_hidden=HEADS * D,
+                      n_heads=HEADS, n_layers=2, slice_num=G, dim_head=512,
+                      use_fused_slice=True)
+    assert wide.use_fused_slice is False, "inert flag on an unsupported shape"
+    print("[smoke] D=512 -> unsupported_dims says %r, model reports "
+          "use_fused_slice=%s" % (unsupported_dims(512, G), wide.use_fused_slice))
 
 
 def main():
     assert torch.cuda.is_available(), "needs a GPU"
     print("[smoke] unsupported_dims(%d, %d) = %r" % (D, G, unsupported_dims(D, G)))
     check_single_layer()
+    check_single_layer(g=G_BLOCKED)
     check_model_and_backward()
     check_fallback_is_visible()
     print("[smoke] OK -- for numerics see bench/parity_test.py")

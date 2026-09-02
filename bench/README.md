@@ -18,10 +18,35 @@ value of `G` separately, since the tile tables differ per `G`.
 ## Timing and memory
 
 ```bash
+python bench_layer.py --slices 256 --dtype bf16              # one layer, eager vs fused, any shape
 python bench_kernels.py --help
-python bench_kernels.py --defaults-only          # the shipped tile tables
-python bench_kernels.py --slices 64 --warps 4    # sweep one setting
+python bench_kernels.py --defaults-only                      # the shipped tile tables, per kernel
+python bench_kernels.py --slices 64 --warps 4                # sweep one setting
+python bench_kernels.py --family blocked --slices 256        # sweep the G-blocked kernels
 ```
+
+`bench_layer.py` is the user's view: one `Physics_Attention_Irregular_Mesh`,
+forward or training step, eager against fused in the same process, time and
+peak memory. `bench_kernels.py` is the per-kernel view for tuning; its
+`--defaults-only` mode prints time, bandwidth and TFLOP/s of every kernel at
+the shipped tiles, which is how to tell a memory-bound kernel from a
+compute-bound one.
+
+Two facts from those numbers that shape any tuning here:
+
+- **The ieee dot path is FMA, not tensor cores.** Even at `G=32` the
+  single-tile kernels run at ~15 TFLOP/s and a quarter of the copy bandwidth,
+  so they are compute-limited, and the blocked kernels at `G=256` do eight
+  times the dot work per point. `set_dot_mode("bf16")` (16-bit inputs) or
+  `"tf32"` moves the dots to tensor cores; at `G=256` that is the difference
+  between slower than eager and several times faster.
+- **The blocked kernels are more tile-sensitive than the single-tile ones.**
+  With borrowed tiles two of them ran 9-11x slower than their single-tile
+  twins at the same shape; a two-dimensional load mask (needed only when D
+  is padded) costs the vectorized loads and with them the layout the FMA dot
+  path wants. Both are handled — masks are compile-time flags and the family
+  has its own tile table — but a new shape deserves a `--family blocked`
+  sweep before its numbers are trusted.
 
 Notes that cost us time and may cost you some:
 

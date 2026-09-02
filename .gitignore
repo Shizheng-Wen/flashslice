@@ -7,3 +7,4 @@ dist/
 # benchmark output
 bench/results/
 bench/*.json
+CLAUDE.md

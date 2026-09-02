@@ -1,4 +1,5 @@
-"""Parity gate for the fused slice/deslice kernels (fused_slice.py).
+"""Parity gate for the fused slice/deslice kernels (kernels/slice_ops.py
+and kernels/blocked.py).
 
 fp32 forward/backward of the fused Physics_Attention_Irregular_Mesh against
 an fp64 eager reference. The gate is purely relative: fused must sit as
@@ -11,7 +12,13 @@ cancellation; eager fp32 loses those digits identically. Also checks
 bf16-autocast forward, run-to-run bitwise determinism (no atomics), the
 no_token_attention / untied_deslice variants, ragged N, and G=64.
 
-Exits nonzero if any check fails. GPU required; run via kernel_bench.sbatch.
+The G-blocked kernels get the same gate: forced onto the paper shape (where
+the single-tile kernels are the default) so the two paths are held to the
+same standard, and then on the shapes only they serve -- G=256 and 512, a
+non-power-of-two G, G below 16, D=64 and 256, a non-power-of-two D, untied
+deslice (which computes its own LSE), ragged N, and the bf16/tf32 dot modes.
+
+Exits nonzero if any check fails. GPU required.
 """
 
 import copy
@@ -52,9 +59,19 @@ def check(name, cond, detail=""):
         FAILED.append(name)
 
 
-def run_case(name, B, N, dim=256, heads=8, dim_head=32, G=32, gate=1.25, **kw):
-    print("case: {} (B={}, N={}, D={}, G={}, {})".format(
-        name, B, N, dim_head, G, kw or "baseline"), flush=True)
+def run_case(name, B, N, dim=256, heads=8, dim_head=32, G=32, gate=1.25,
+             kernel_mode="auto", **kw):
+    from flashslice.kernels import slice_ops as fs
+    print("case: {} (B={}, N={}, D={}, G={}, kernels={}, {})".format(
+        name, B, N, dim_head, G, kernel_mode, kw or "baseline"), flush=True)
+    fs.set_kernel_mode(kernel_mode)
+    try:
+        _run_case(B, N, dim, heads, dim_head, G, gate, kw)
+    finally:
+        fs.set_kernel_mode("auto")
+
+
+def _run_case(B, N, dim, heads, dim_head, G, gate, kw):
     torch.manual_seed(7)
     base = Physics_Attention_Irregular_Mesh(
         dim, heads=heads, dim_head=dim_head, dropout=0.0, slice_num=G,
@@ -115,13 +132,23 @@ def run_case(name, B, N, dim=256, heads=8, dim_head=32, G=32, gate=1.25, **kw):
 
 
 def run_bf16_case(name, dot, B=1, N=86840, dim=256, heads=8, dim_head=32,
-                  G=32):
+                  G=32, kernel_mode="auto"):
     """bf16-autocast fwd+bwd: fused (given dot mode) vs eager, both against
     the fp64 reference. Everything here is bf16-class noise; the gate asks
     the fused error to stay within 2x of eager's (same class), plus bitwise
     determinism across two fused runs."""
     from flashslice.kernels import slice_ops as fs
-    print("case: {} (bf16 autocast, dot={})".format(name, dot), flush=True)
+    print("case: {} (bf16 autocast, dot={}, G={}, kernels={})".format(
+        name, dot, G, kernel_mode), flush=True)
+    fs.set_kernel_mode(kernel_mode)
+    try:
+        _run_bf16_case(dot, B, N, dim, heads, dim_head, G)
+    finally:
+        fs.set_kernel_mode("auto")
+
+
+def _run_bf16_case(dot, B, N, dim, heads, dim_head, G):
+    from flashslice.kernels import slice_ops as fs
     torch.manual_seed(7)
     base = Physics_Attention_Irregular_Mesh(
         dim, heads=heads, dim_head=dim_head, dropout=0.0, slice_num=G).cuda()
@@ -177,6 +204,22 @@ def main():
     run_case("g128", B=1, N=30013, G=128)
     run_case("tiny-N17", B=2, N=17)
     run_case("one-block-N64", B=1, N=64)
+    # The G-blocked kernels, first forced onto shapes the single-tile kernels
+    # serve by default (same gate, same reference), then on their own shapes.
+    blk = dict(kernel_mode="blocked")
+    run_case("blk-paper-shape", B=1, N=86840, **blk)
+    run_case("blk-B2-ragged", B=2, N=10007, **blk)
+    run_case("blk-tiny-N17", B=2, N=17, G=256, **blk)
+    run_case("blk-g256", B=1, N=30013, G=256, **blk)
+    run_case("blk-g512", B=1, N=10007, G=512, **blk)
+    run_case("blk-g48-masked", B=1, N=30013, G=48, **blk)
+    run_case("blk-g8-padded", B=1, N=30013, G=8, **blk)
+    run_case("blk-d64-g256", B=1, N=20011, dim=512, dim_head=64, G=256, **blk)
+    run_case("blk-d256", B=1, N=10007, dim=1024, heads=4, dim_head=256, G=32,
+             **blk)
+    run_case("blk-d24-g40", B=1, N=20011, dim=192, dim_head=24, G=40, **blk)
+    run_case("blk-untied-g256", B=1, N=20011, G=256, untied_deslice=True,
+             **blk)
     # Opt-in tf32 value dots vs the ambient eager baseline. Eager's slice
     # einsums stay fp32 under allow_tf32 (skinny cuBLAS shapes), so fused-tf32
     # is measurably noisier than eager here by design (~3-4x, still ~5x below
@@ -185,10 +228,18 @@ def main():
     from flashslice.kernels import slice_ops as _fs
     _fs.set_dot_mode("tf32")
     run_case("tf32-optin", B=1, N=86840, gate=10.0)
+    _fs.set_dot_mode("tf32")
+    run_case("blk-tf32-optin-g256", B=1, N=30013, G=256, gate=10.0,
+             kernel_mode="blocked")
     _fs.set_dot_mode("")
     # bf16-native dots vs the eager bf16-autocast baseline (same class).
     run_bf16_case("bf16-value-dots", "bf16v")
     run_bf16_case("bf16-all-dots", "bf16")
+    run_bf16_case("blk-bf16-value-dots-g256", "bf16v", N=30013, G=256,
+                  kernel_mode="blocked")
+    run_bf16_case("blk-bf16-all-dots-g256", "bf16", N=30013, G=256,
+                  kernel_mode="blocked")
+    run_bf16_case("blk-bf16-all-dots-paper", "bf16", kernel_mode="blocked")
     print("\n{} check(s) failed".format(len(FAILED)) if FAILED
           else "\nALL PARITY CHECKS PASSED")
     sys.exit(1 if FAILED else 0)
