@@ -93,6 +93,8 @@ def main():
     p.add_argument("--block-g", type=int, default=None,
                    help="G-block size for --family blocked (default: "
                         "blocked.tiles)")
+    p.add_argument("--dots", default="ieee,tf32,bf16",
+                   help="dot modes to sweep (ieee, tf32, bf16, tf32x3)")
     a = p.parse_args()
     if a.family == "blocked":
         fb.set_block_g(a.block_g)
@@ -202,16 +204,16 @@ def main():
                 if a.family == "blocked":
                     return fb._launch_cfg(kname, xm, dot, GB, DT)
                 bn, warps, stages = fs._cfg(kname, xm, dot, G, D)
-                if dot == 1 and kname != "deslice_fwd":
-                    stages = 1
+                if kname != "deslice_fwd":
+                    stages = fs._stages(dot, stages)
                 return bn, warps, stages
 
             if a.defaults_only:
                 # P2 table: production _CFG configs only, every dot mode valid
                 # for the dtype, with theoretical-minimum bytes and % of the
                 # measured copy peak.
-                dlbl = {0: "ieee", 1: "tf32", 2: "bf16v", 3: "bf16"}
-                dots = (0, 1) if dt == torch.float32 else (0, 1, 2, 3)
+                dlbl = {0: "ieee", 1: "tf32", 2: "bf16v", 3: "bf16", 4: "tf32x3"}
+                dots = (0, 1, 4) if dt == torch.float32 else (0, 1, 2, 3, 4)
                 for kname in nbytes:
                     for dot in dots:
                         bn, warps, st = default_cfg(kname, dot)
@@ -237,27 +239,28 @@ def main():
                               flush=True)
                 continue
 
+            dot_levels = [{"ieee": 0, "tf32": 1, "bf16": 3, "tf32x3": 4}[d]
+                          for d in a.dots.split(",")]
             for bn, warps, stages, dot in itertools.product(
                     [int(v) for v in a.bns.split(",")],
                     [int(w) for w in a.warps.split(",")],
-                    (1, 2, 3), (0, 1, 3)):
+                    (1, 2, 3), dot_levels):
                 if dot == 3 and dt == torch.float32:
                     continue  # bf16 dots are for 16-bit inputs only
                 launches = make_launches(bn, warps, stages, dot)
                 for kname, fn in launches.items():
-                    if dot == 1 and stages != 1 and kname != "deslice_fwd":
+                    if dot in (1, 4) and stages != 1 and kname != "deslice_fwd":
                         # Triton 3.0's loop pipeliner segfaults compiling async
                         # tf32 dots (uncatchable); bf16 dots survive.
                         continue
-                    if (dot == 3 and warps > 4
-                            and kname in ("slice_bwd_n", "deslice_bwd_n")):
+                    if dot and warps > 4 and "bwd" in kname:
                         # Triton 3.0 aborts (assert) on an mma -> mma layout
-                        # conversion in the two-pass N-owned backward kernels
-                        # with bf16 dots on 8 warps (blocked._launch_cfg).
+                        # conversion in backward kernels with tensor-core
+                        # dots on 8 warps (blocked._launch_cfg, slice_ops._cfg).
                         continue
                     tag = "{}/bn{}w{}s{}/{}".format(
                         kname, bn, warps, stages,
-                        {0: "ieee", 1: "tf32", 3: "bf16"}[dot])
+                        {0: "ieee", 1: "tf32", 3: "bf16", 4: "tf32x3"}[dot])
                     if a.verbose:
                         # Triton aborts (not raises) on some shapes — e.g. the
                         # MMA-N assert at G=16 — so the last line printed is
@@ -284,7 +287,8 @@ def main():
     for (kname, dt_s, N, dot), (ms, bn, warps, stages) in sorted(
             best.items(), key=str):
         print("{:12s} {:4s} N={:>8} {}: {:7.3f} ms  bn={:>3} warps={} stages={}"
-              .format(kname, dt_s, N, {0: "ieee", 1: "tf32", 3: "bf16"}[dot],
+              .format(kname, dt_s, N,
+                      {0: "ieee", 1: "tf32", 3: "bf16", 4: "tf32x3"}[dot],
                       ms, bn, warps, stages), flush=True)
 
     _dump(a, B, H, D, G, results, best)

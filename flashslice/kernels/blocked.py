@@ -68,7 +68,7 @@ import torch
 import triton
 import triton.language as tl
 
-from .slice_ops import _cfg, _dot, _dot_w, _n_programs, _strides
+from .slice_ops import _cfg, _dot, _dot_w, _n_programs, _stages, _strides
 
 _BLOCK_G = None  # None = choose from D; set_block_g overrides
 
@@ -744,13 +744,15 @@ def _cfg_blk(kernel, is16, dot, gb, dt):
     # inputs may take the fp32 entry of the same level. Level 3 (all dots
     # bf16) never borrows a lower level: MMA-layout tiles are their own
     # world, and its absence means the single-tile bf16 table applies.
+    # tf32x3 (4) has tf32's register profile (MMA operands, fp32 tiles) and
+    # takes its entry until it has a sweep of its own.
     keys = [(is16, dot)]
-    if dot == 2:
+    if dot in (2, 4):
         keys.append((is16, 1))
-    if dot < 3:
+    if dot != 3:
         keys.append((is16, 0))
         if is16:
-            keys += [(False, dot), (False, 1 if dot == 2 else 0), (False, 0)]
+            keys += [(False, dot), (False, 1 if dot in (2, 4) else 0), (False, 0)]
     for key in keys:
         if key in entry:
             return entry[key]
@@ -775,13 +777,14 @@ def _launch_cfg(kernel, t, dot, gb, dt):
     """(BLOCK_N, num_warps, num_stages) for a blocked kernel."""
     cfg = _cfg_blk(kernel, t.dtype != torch.float32, dot, gb, dt)
     bn, warps, stages = cfg or _cfg(_FAMILY[kernel], t, dot, gb, dt)
-    if dot == 1:
-        stages = 1  # Triton 3.0 pipeliner segfault on async tf32 dots
-    if dot == 3 and warps > 4 and kernel in ("slice_bwd_n", "deslice_bwd_n"):
-        # Triton 3.0 aborts the process (assert, not exception) compiling the
-        # two-pass N-owned backward kernels with bf16 MMA dots on 8 warps:
-        # "mma -> mma layout conversion is only supported on Ampere"
-        # (job 3262885, slice_bwd_n bn64 w8 s1 bf16 at G_block=64).
+    stages = _stages(dot, stages)
+    if dot and warps > 4 and kernel.endswith(("_bwd_n", "_bwd_g")):
+        # Triton 3.0 aborts the process (assert, not exception) compiling a
+        # backward kernel with tensor-core dots on 8 warps: "mma -> mma
+        # layout conversion is only supported on Ampere" (job 3262885,
+        # slice_bwd_n bn64 w8 s1 bf16 at G_block=64; job 3264786, the
+        # single-tile slice_bwd at G=128 under tf32x3). Forward kernels on 8
+        # warps compiled and ran in the same sweeps.
         warps = 4
     return bn, warps, stages
 

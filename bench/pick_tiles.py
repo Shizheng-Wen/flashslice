@@ -18,7 +18,7 @@ from collections import defaultdict
 
 KERNELS = ("stats", "slice_fwd_g", "deslice_fwd_n", "slice_bwd_n",
            "slice_bwd_g", "deslice_bwd_n", "deslice_bwd_g")
-DOT_LEVEL = {"ieee": 0, "tf32": 1, "bf16v": 2, "bf16": 3}
+DOT_LEVEL = {"ieee": 0, "tf32": 1, "bf16v": 2, "bf16": 3, "tf32x3": 4}
 
 
 def _tiles(d, g):

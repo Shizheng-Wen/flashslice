@@ -24,10 +24,13 @@ summation-order only (cuBLAS also serves the skinny slice einsums with fp32
 kernels even under ``allow_tf32``). ``FLASHSLICE_DOT_MODE`` (or
 ``set_dot_mode``) opts into faster tensor-core dots: ``tf32`` (value dots
 tf32, ~5e-4 output noise — between exact fp32 and the bf16 class), ``bf16v``
-(value dots bf16, 16-bit inputs only) or ``bf16`` (all dots bf16 — the same
-precision class as the eager bf16-autocast einsums). Accumulation stays fp32
-in every mode; below the full-bf16 level the slice-weight logits dot stays
-ieee because the softmax Jacobian amplifies any noise in w.
+(value dots bf16, 16-bit inputs only), ``bf16`` (all dots bf16 — the same
+precision class as the eager bf16-autocast einsums) or ``tf32x3`` (every dot
+as three tf32 tensor-core products that reconstruct an fp32 product to
+~2^-21 — fp32-class accuracy at tensor-core speed, the answer to the ieee
+path being an FMA path). Accumulation stays fp32 in every mode; below the
+full-bf16 level the slice-weight logits dot stays ieee (or tf32x3) because
+the softmax Jacobian amplifies any noise in w.
 
 Layout: kernels read x_mid / fx_mid in the natural GEMM output layout
 (B, N, H, D) via strides — the eager permute+contiguous copies disappear.
@@ -151,18 +154,26 @@ def _cfg(name, t, dot=0, g=32, d=32):
         # Triton 3.0 aborts (assert, not exception) when it splits a
         # tensor-core dot of N=16 across 8 warps: per-warp MMA N=8.
         warps = 4
+    if dot and warps > 4 and name in ("slice_bwd", "deslice_bwd"):
+        # Triton 3.0 aborts (assert) compiling a backward kernel whose
+        # tensor-core dot output feeds another dot on 8 warps: "mma -> mma
+        # layout conversion is only supported on Ampere" (job 3264786, G=128
+        # tf32x3 at (64, 8, 2)). The ieee tables keep their 8-warp entries.
+        warps = 4
     return bn, warps, stages
 
 _DOT_ENV = os.environ.get("FLASHSLICE_DOT_MODE", "").lower()
 
-# 0=ieee fp32, 1=tf32 value dots, 2=bf16 value dots, 3=all dots bf16.
+# 0=ieee fp32, 1=tf32 value dots, 2=bf16 value dots, 3=all dots bf16,
+# 4=all dots tf32x3 (split-precision on tensor cores, fp32-class).
 # Accumulation is fp32 in every mode. The logits dot (w computation) stays
 # ieee below level 3 — the softmax Jacobian amplifies noise in w.
-_DOT_LEVELS = {"": 0, "ieee": 0, "tf32": 1, "bf16v": 2, "bf16": 3}
+_DOT_LEVELS = {"": 0, "ieee": 0, "tf32": 1, "bf16v": 2, "bf16": 3,
+               "tf32x3": 4}
 
 
 def set_dot_mode(mode):
-    """'ieee' (default), 'tf32', 'bf16v' or 'bf16' — overrides
+    """'ieee' (default), 'tf32', 'bf16v', 'bf16' or 'tf32x3' — overrides
     FLASHSLICE_DOT_MODE. Explicit opt-in only; not tied to torch's
     allow_tf32 (cuBLAS serves the skinny eager slice einsums with fp32
     kernels even when that flag is set)."""
@@ -172,9 +183,15 @@ def set_dot_mode(mode):
 
 def _dot_mode(t):
     lvl = _DOT_LEVELS[_DOT_ENV]
-    if lvl >= 2 and t.dtype == torch.float32:
+    if lvl in (2, 3) and t.dtype == torch.float32:
         return 1  # bf16 dots only for 16-bit inputs; fp32 falls back to tf32
     return lvl
+
+
+def _stages(dot, stages):
+    """Triton 3.0's loop pipeliner segfaults (uncatchable) compiling async
+    tf32 dots: single-stage for the tf32 and tf32x3 levels."""
+    return 1 if dot in (1, 4) else stages
 
 
 _D_MAX = 256  # D is held whole in every kernel (padded to a power of two)
@@ -254,7 +271,9 @@ def _strides(t):
 @triton.jit
 def _dot(a, b, DOT: tl.constexpr):
     """Value/gradient dot at the requested precision; fp32 accumulation."""
-    if DOT >= 2:
+    if DOT == 4:
+        return tl.dot(a, b, input_precision="tf32x3")
+    elif DOT >= 2:
         return tl.dot(a.to(tl.bfloat16), b.to(tl.bfloat16))
     else:
         return tl.dot(a, b, input_precision="tf32" if DOT == 1 else "ieee")
@@ -262,9 +281,11 @@ def _dot(a, b, DOT: tl.constexpr):
 
 @triton.jit
 def _dot_w(a, b, DOT: tl.constexpr):
-    """Logits dot for w: ieee unless full-bf16 mode (level 3)."""
+    """Logits dot for w: ieee unless full-bf16 (3) or tf32x3 (4) mode."""
     if DOT == 3:
         return tl.dot(a.to(tl.bfloat16), b.to(tl.bfloat16))
+    elif DOT == 4:
+        return tl.dot(a, b, input_precision="tf32x3")
     else:
         return tl.dot(a, b, input_precision="ieee")
 
@@ -511,8 +532,7 @@ def _slice_impl(x_mid, fx_mid, weight, bias, tau, dot):
     G = weight.shape[0]
     weight, bias, tau = weight.contiguous(), bias.contiguous(), tau.contiguous()
     bn, warps, stages = _cfg("slice_fwd", x_mid, dot, G, D)
-    if dot == 1:  # only tf32 triggers the Triton 3.0 pipeliner segfault;
-        stages = 1  # bf16 dots survive stages>1 (probe_bf16_stages.py)
+    stages = _stages(dot, stages)
     P = _n_programs(N, B * H, bn)
     part_z = torch.empty(B * H * P, G, D, device=x_mid.device,
                          dtype=torch.float32)
@@ -532,8 +552,7 @@ def _slice_bwd_impl(x_mid, fx_mid, weight, bias, tau, dz_num, ds, dot):
     dxm = torch.empty_like(x_mid)
     dfx = torch.empty_like(fx_mid)
     bn, warps, stages = _cfg("slice_bwd", x_mid, dot, G, D)
-    if dot == 1:  # only tf32 triggers the Triton 3.0 pipeliner segfault;
-        stages = 1  # bf16 dots survive stages>1 (probe_bf16_stages.py)
+    stages = _stages(dot, stages)
     P = _n_programs(N, B * H, bn)
     pdw = torch.empty(B * H * P, G, D, device=x_mid.device, dtype=torch.float32)
     pdb = torch.empty(B * H * P, G, device=x_mid.device, dtype=torch.float32)
@@ -568,8 +587,7 @@ def _deslice_bwd_impl(x_mid, weight, bias, tau, tokens, d_out, dot):
     d_out = d_out.contiguous()
     dxm = torch.empty_like(x_mid)
     bn, warps, stages = _cfg("deslice_bwd", x_mid, dot, G, D)
-    if dot == 1:  # only tf32 triggers the Triton 3.0 pipeliner segfault;
-        stages = 1  # bf16 dots survive stages>1 (probe_bf16_stages.py)
+    stages = _stages(dot, stages)
     P = _n_programs(N, B * H, bn)
     pdtok = torch.empty(B * H * P, G, D, device=x_mid.device,
                         dtype=torch.float32)

@@ -75,12 +75,21 @@ is the precision of the dots, chosen with `set_dot_mode(...)` or the
 | `tf32` | value dots on tensor cores, logits fp32 | ~5e-4 on outputs | fp32 inputs at large `G` |
 | `bf16v` | value dots bf16, logits fp32 (16-bit inputs) | between the two | — |
 | `bf16` | all dots bf16 (16-bit inputs) | eager bf16 autocast's own | bf16 training at large `G` |
+| `tf32x3` | every dot as three tf32 products on tensor cores | 3–7× eager fp32's | fp32 inputs at large `G` when tf32's noise is too much |
 
 The logits dot stays fp32 below the `bf16` level because the softmax
 Jacobian amplifies noise in the slice weights. At the single-tile shapes the
 default is also the fast choice; at large `G` the kernels are bound by dot
 throughput and a tensor-core mode is what makes them faster than eager (see
 the blocked table below).
+
+`tf32x3` is the split-precision trick — `a·b ≈ a_hi·b_hi + a_hi·b_lo +
+a_lo·b_hi` with tf32 parts — and Triton's implementation lands two to three
+bits short of fp32 rather than on it: measured on outputs and every
+gradient it is 3–7× eager's fp32 error, against tf32's ~1000×. It costs
+three tensor-core products per dot plus the splitting, so it does not pay at
+`G=32` (1.27× eager where `ieee` is 1.72×) and does at `G=256` with fp32
+inputs, where it is the fastest mode (1.92× at `N=1M`).
 
 ## What the kernel does
 
@@ -180,8 +189,11 @@ mode is the `set_dot_mode` setting: `ieee` is the default, `bf16` needs
 | bf16 / bf16, inference | 256 | 1M | 39.4 ms | 13.3 ms | **2.96×** | 17.0 GB | 2.1 GB | 88% |
 | bf16 / bf16, inference | 256 | 4.2M | 157.3 ms | 53.2 ms | **2.95×** | 68.0 GB | 8.3 GB | 88% |
 | bf16 / bf16 | 48 | 262k | 13.0 ms | 6.1 ms | **2.12×** | 3.1 GB | 2.0 GB | 35% |
+| fp32 / tf32x3 | 256 | 262k | 45.4 ms | 37.4 ms | 1.21× | 14.8 GB | 2.0 GB | 86% |
+| fp32 / tf32x3 | 256 | 1M | 283.6 ms | 147.7 ms | **1.92×** | 59.0 GB | 8.1 GB | 86% |
 | fp32 / tf32 | 256 | 262k | 45.1 ms | 40.5 ms | 1.11× | 14.8 GB | 2.0 GB | 86% |
 | fp32 / ieee | 256 | 262k | 45.1 ms | 53.2 ms | 0.85× | 14.8 GB | 2.0 GB | 86% |
+| fp32 / ieee | 256 | 1M | 284.2 ms | 209.6 ms | 1.36× | 59.0 GB | 8.1 GB | 86% |
 | bf16 / tf32 | 256 | 262k | 47.5 ms | 40.0 ms | 1.19× | 13.7 GB | 2.0 GB | 85% |
 | bf16 / ieee | 256 | 262k | 47.4 ms | 64.0 ms | 0.74× | 13.7 GB | 2.0 GB | 85% |
 | bf16 / ieee | 256 | 1M | 294.3 ms | 253.4 ms | 1.16× | 54.5 GB | 8.1 GB | 85% |
@@ -201,10 +213,10 @@ Reading it:
   multiply-adds, and at `G=256` a point does eight times the work it does at
   `G=32`. Triton's `ieee` fp32 dot is an FMA path at ~15 TFLOP/s on this
   GPU, so in the default mode the blocked kernels are compute-bound and
-  land around eager's time; on tensor cores (`tf32` for fp32 inputs, `bf16`
-  for 16-bit inputs) they are 3–6× faster than eager. The single-tile
-  kernels at `G=32` are near the memory/compute crossover, which is why the
-  tables above did not need this choice.
+  land around eager's time; on tensor cores they pull ahead — `bf16` for
+  16-bit inputs by 3–6×, `tf32x3` for fp32 inputs by up to 1.9×. The
+  single-tile kernels at `G=32` are near the memory/compute crossover,
+  which is why the tables above did not need this choice.
 - **Wide heads gain nothing.** At `D=256` the weight tensor is one eighth of
   the point activations and the blocked layer is 0.79× eager at 4% less
   memory; the kernels run there, but the bottleneck the paper found is not

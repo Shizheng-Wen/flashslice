@@ -37,9 +37,16 @@ Two facts from those numbers that shape any tuning here:
 - **The ieee dot path is FMA, not tensor cores.** Even at `G=32` the
   single-tile kernels run at ~15 TFLOP/s and a quarter of the copy bandwidth,
   so they are compute-limited, and the blocked kernels at `G=256` do eight
-  times the dot work per point. `set_dot_mode("bf16")` (16-bit inputs) or
-  `"tf32"` moves the dots to tensor cores; at `G=256` that is the difference
-  between slower than eager and several times faster.
+  times the dot work per point. `set_dot_mode("bf16")` (16-bit inputs),
+  `"tf32"` or `"tf32x3"` moves the dots to tensor cores; at `G=256` that is
+  the difference between slower than eager and several times faster.
+  `tf32x3` was the attempt to get fp32 accuracy on tensor cores: it lands
+  at 3–7x eager's fp32 error (not parity), is slower than `ieee` at `G=32`
+  and the fastest fp32 mode at `G=256`.
+- **Backward kernels with tensor-core dots must stay on 4 warps.** Triton 3.0
+  aborts the process (an assert, not an exception) on an mma -> mma layout
+  conversion when such a kernel is compiled for 8 warps; both tile lookups
+  clamp it and the sweep skips those configurations.
 - **The blocked kernels are more tile-sensitive than the single-tile ones.**
   With borrowed tiles two of them ran 9-11x slower than their single-tile
   twins at the same shape; a two-dimensional load mask (needed only when D

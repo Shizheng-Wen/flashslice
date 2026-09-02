@@ -16,7 +16,14 @@ The G-blocked kernels get the same gate: forced onto the paper shape (where
 the single-tile kernels are the default) so the two paths are held to the
 same standard, and then on the shapes only they serve -- G=256 and 512, a
 non-power-of-two G, G below 16, D=64 and 256, a non-power-of-two D, untied
-deslice (which computes its own LSE), ragged N, and the bf16/tf32 dot modes.
+deslice (which computes its own statistics), ragged N, and the bf16/tf32 dot
+modes.
+
+tf32x3 (every dot as three tf32 tensor-core products) is gated at 10x eager
+like tf32: measured, it sits at 3-7x eager's fp32 error on outputs and
+gradients (job 3264786) — fp32-class in spirit, two to three bits short in
+fact, and 200x tighter than tf32. Its G=128 case is the one that exercises
+the 8-warp tensor-core guard in the backward kernels.
 
 Exits nonzero if any check fails. GPU required.
 """
@@ -230,6 +237,11 @@ def main():
     run_case("tf32-optin", B=1, N=86840, gate=10.0)
     _fs.set_dot_mode("tf32")
     run_case("blk-tf32-optin-g256", B=1, N=30013, G=256, gate=10.0,
+             kernel_mode="blocked")
+    _fs.set_dot_mode("tf32x3")
+    run_case("tf32x3-optin", B=1, N=86840, gate=10.0)
+    run_case("tf32x3-g128", B=1, N=30013, G=128, gate=10.0)
+    run_case("blk-tf32x3-g256", B=1, N=30013, G=256, gate=10.0,
              kernel_mode="blocked")
     _fs.set_dot_mode("")
     # bf16-native dots vs the eager bf16-autocast baseline (same class).
