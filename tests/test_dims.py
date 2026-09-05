@@ -133,3 +133,59 @@ def test_forward_matches_eager_on_unsupported_dims():
         a = fused(x)[0]
         b = eager(x)[0]
     assert torch.equal(a, b)
+
+
+# --------------------------------------------------------------------------- #
+# value width apart from the logits width, and the blocked tile lookup
+# --------------------------------------------------------------------------- #
+
+@pytest.mark.parametrize("d,g,dv", [(32, 32, 24), (56, 1024, 32), (64, 64, 32)])
+def test_value_width_routes_to_blocked(d, g, dv):
+    """fx_mid / tokens narrower or wider than x_mid: served, by the blocked
+    kernels only (the single-tile kernels hold one width)."""
+    assert unsupported_dims(d, g, dv) is None
+    assert not single_tile_dims(d, g, dv)
+    assert _use_blocked(d, g, dv)
+
+
+def test_equal_value_width_keeps_single_tile():
+    assert single_tile_dims(32, 32, 32)
+    assert not _use_blocked(32, 32, 32)
+
+
+def test_value_width_bounds():
+    assert "value width" in unsupported_dims(32, 32, 512)
+    assert "value width" in unsupported_dims(32, 32, 0)
+
+
+def test_cfg_blk_prefers_value_width_entry():
+    """A (G_block, D_tile, DV_tile) entry wins over (G_block, D_tile), which
+    wins over the borrowed single-tile table."""
+    from flashslice.kernels import blocked as fb
+
+    saved = dict(fb._CFG_BLK)
+    try:
+        fb._CFG_BLK[(32, 64)] = {"deslice_fwd_n": {(True, 3): (128, 4, 2)}}
+        fb._CFG_BLK[(32, 64, 32)] = {"deslice_fwd_n": {(True, 3): (256, 4, 1)}}
+        assert fb._cfg_blk("deslice_fwd_n", True, 3, 32, 64, 32) == (256, 4, 1)
+        assert fb._cfg_blk("deslice_fwd_n", True, 3, 32, 64, 64) == (128, 4, 2)
+        assert fb._cfg_blk("deslice_fwd_n", True, 3, 32, 64) == (128, 4, 2)
+        # a kernel the value-width entry lacks falls through to the wider key
+        assert fb._cfg_blk("stats", True, 3, 32, 64, 32) is None
+    finally:
+        fb._CFG_BLK.clear()
+        fb._CFG_BLK.update(saved)
+
+
+def test_stats_mode_switch():
+    from flashslice.kernels import blocked as fb
+
+    assert fb.stats_mode() in ("online", "two-pass")
+    try:
+        fb.set_stats_mode("two-pass")
+        assert fb.stats_mode() == "two-pass"
+        with pytest.raises(ValueError):
+            fb.set_stats_mode("streaming")
+    finally:
+        fb.set_stats_mode("online")
+    assert fb.stats_mode() == "online"

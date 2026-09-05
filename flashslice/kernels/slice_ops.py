@@ -782,7 +782,8 @@ torch.library.register_autograd("flashslice::flash_deslice", _deslice_grad,
 # public API
 # --------------------------------------------------------------------------- #
 
-def fused_slice(x_mid, fx_mid, weight, bias, tau, return_stats=False):
+def fused_slice(x_mid, fx_mid, weight, bias, tau, return_stats=False,
+                stats=None):
     """x_mid: (B, N, H, D); fx_mid: (B, N, H, DV); weight: (G, D), (H, G, D)
     or (B, H, G, D); bias: None, (G,), (H, G) or (B, H, G); tau: (H,).
     Returns fp32 z_num (B, H, G, DV) and s (B, H, G); normalize outside as
@@ -798,26 +799,29 @@ def fused_slice(x_mid, fx_mid, weight, bias, tau, return_stats=False):
     produced it. The kernels read the weight through strides, so the shape
     costs nothing; a non-contiguous weight is copied once per call.
 
-    With ``return_stats=True`` a third value is returned: on the blocked path
-    the per-point softmax statistics of the slice logits — row max and sum of
+    ``stats``, when given, are the per-point softmax statistics of these very
+    logits from an op that ran before on the same x_mid, weight, bias and
+    tau — a tied deslice, ``fused_deslice(..., return_stats=True)`` — and
+    the statistics pass is skipped. With ``return_stats=True`` a third value
+    is returned: on the blocked path those statistics — row max and sum of
     exponentials, (B, H, 2, N) fp32, detached — which ``fused_deslice`` can
-    reuse when it shares the slice weights (the tied case); on the
-    single-tile path, which never forms them, ``None``. Either value is
-    accepted by ``fused_deslice``."""
+    reuse when it shares the slice weights; on the single-tile path, which
+    never forms them, ``None``. Either value is accepted by either op."""
     weight, bias, G = _prep_wb(x_mid, weight, bias)
     D, DV = x_mid.shape[3], fx_mid.shape[3]
     _check_dims(D, G, DV)
     dot = _dot_mode(x_mid)
     if _use_blocked(D, G, DV):
-        z_num, s, stats = torch.ops.flashslice.slice_blk(
-            x_mid, fx_mid, weight, bias, tau, dot)
-        return (z_num, s, stats.detach()) if return_stats else (z_num, s)
+        z_num, s, st = torch.ops.flashslice.slice_blk(
+            x_mid, fx_mid, weight, bias, tau, stats, dot)
+        return (z_num, s, st.detach()) if return_stats else (z_num, s)
     z_num, s = torch.ops.flashslice.flash_slice(x_mid, fx_mid, weight, bias,
                                                 tau, dot)
     return (z_num, s, None) if return_stats else (z_num, s)
 
 
-def fused_deslice(x_mid, weight, bias, tau, tokens, stats=None):
+def fused_deslice(x_mid, weight, bias, tau, tokens, stats=None,
+                  return_stats=False):
     """tokens: (B, H, G, DV) mixed tokens z'. Returns out (B, N, H, DV) in
     x_mid's dtype — already in the layout to_out expects after a reshape.
     weight and bias take the shapes ``fused_slice`` documents.
@@ -825,14 +829,18 @@ def fused_deslice(x_mid, weight, bias, tau, tokens, stats=None):
     ``stats`` is what ``fused_slice(..., return_stats=True)`` returned for
     the *same* x_mid, weight, bias and tau; pass it to skip recomputing it,
     or leave it None (always None for untied deslice, whose weights differ).
-    The single-tile path ignores it."""
+    With no statistics in hand the blocked path forms out and the statistics
+    in one online pass, and ``return_stats=True`` returns ``(out, stats)`` so
+    a tied slice that follows can take them (``fused_slice(..., stats=)``);
+    the single-tile path returns ``(out, None)``."""
     weight, bias, G = _prep_wb(x_mid, weight, bias)
     D, DV = x_mid.shape[3], tokens.shape[3]
     _check_dims(D, G, DV)
     dot = _dot_mode(x_mid)
     if _use_blocked(D, G, DV):
-        out, _ = torch.ops.flashslice.deslice_blk(x_mid, weight, bias, tau,
-                                                  tokens, stats, dot)
-        return out
-    return torch.ops.flashslice.flash_deslice(x_mid, weight, bias, tau, tokens,
-                                              dot)
+        out, st = torch.ops.flashslice.deslice_blk(x_mid, weight, bias, tau,
+                                                   tokens, stats, dot)
+        return (out, st.detach()) if return_stats else out
+    out = torch.ops.flashslice.flash_deslice(x_mid, weight, bias, tau, tokens,
+                                             dot)
+    return (out, None) if return_stats else out

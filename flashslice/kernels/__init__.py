@@ -20,8 +20,15 @@ neither family can serve a shape and ``None`` when one can; the layer uses it
 to fall back to the eager path loudly instead of failing.
 
 ``set_dot_mode`` selects the dot precision: ``"ieee"`` (default, exact fp32),
-``"tf32"``, ``"bf16v"`` or ``"bf16"``. It is an explicit opt-in and is not tied
-to torch's ``allow_tf32``.
+``"tf32"``, ``"bf16v"``, ``"bf16"`` or ``"tf32x3"``. It is an explicit opt-in
+and is not tied to torch's ``allow_tf32``. ``set_stats_mode`` chooses how the
+blocked kernels form the per-point softmax statistics when none are handed
+in: ``"online"`` (default, one pass; a deslice forms its output in the same
+pass) or ``"two-pass"`` (the original max-then-sum form).
+
+The slice weight may be shared, per head or per sample and head — (G, D),
+(H, G, D), (B, H, G, D) — and the logits width D may differ from the value
+width of fx_mid and the tokens; both are documented on ``fused_slice``.
 
 The implementation lives in ``slice_ops`` rather than ``fused_slice`` on
 purpose: a module named after the function it exports shadows that function on
@@ -38,7 +45,8 @@ from .slice_ops import (
     set_kernel_mode,
 )
 from . import blocked  # noqa: F401  — registers the flashslice::*_blk ops
-from .blocked import set_block_g
+from .blocked import set_block_g, set_stats_mode, stats_mode
 
 __all__ = ["fused_slice", "fused_deslice", "unsupported_dims", "single_tile_dims",
-           "set_dot_mode", "set_kernel_mode", "set_block_g"]
+           "set_dot_mode", "set_kernel_mode", "set_block_g", "set_stats_mode",
+           "stats_mode"]

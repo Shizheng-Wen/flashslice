@@ -3,12 +3,13 @@
     python bench/pick_tiles.py bench/results/sweep_blk_g256_fp32.json \\
                               bench/results/sweep_blk_g256_bf16.json
 
-Reads the results of each JSON (one sweep = one G, one dtype, any dot
-levels), groups by (G_block, D_tile) and prints the dict literal to paste
-into flashslice/kernels/blocked.py. When several N values were swept the
-winner is the config with the lowest mean slowdown against the per-N best,
-the rule the single-tile tables were built with. Pure Python: no torch, no
-GPU, safe on a login node.
+Reads the results of each JSON (one sweep = one shape, one dtype, any dot
+levels), groups by (G_block, D_tile) -- or (G_block, D_tile, DV_tile) when
+the sweep's value width differs from its logits width -- and prints the dict
+literal to paste into flashslice/kernels/blocked.py. When several N values
+were swept the winner is the config with the lowest mean slowdown against
+the per-N best, the rule the single-tile tables were built with. Pure
+Python: no torch, no GPU, safe on a login node.
 """
 
 import json
@@ -16,8 +17,8 @@ import re
 import sys
 from collections import defaultdict
 
-KERNELS = ("stats", "slice_fwd_g", "deslice_fwd_n", "slice_bwd_n",
-           "slice_bwd_g", "deslice_bwd_n", "deslice_bwd_g")
+KERNELS = ("stats", "slice_fwd_g", "deslice_fwd_n", "deslice_fwd_online",
+           "slice_bwd_n", "slice_bwd_g", "deslice_bwd_n", "deslice_bwd_g")
 DOT_LEVEL = {"ieee": 0, "tf32": 1, "bf16v": 2, "bf16": 3, "tf32x3": 4}
 
 
@@ -28,6 +29,15 @@ def _tiles(d, g):
     return dt, min(max(16, min(64, 2048 // dt)), p2(g))
 
 
+def _key(dims):
+    if "G_block" in dims:
+        dt, gb = dims["D_tile"], dims["G_block"]
+    else:
+        dt, gb = _tiles(dims["D"], dims["G"])
+    dvt = dims.get("DV_tile")
+    return (gb, dt, dvt) if dvt and dvt != dt else (gb, dt)
+
+
 def main(paths):
     tables = defaultdict(lambda: defaultdict(dict))
     for path in paths:
@@ -36,10 +46,7 @@ def main(paths):
         dims = data["dims"]
         if dims.get("family") != "blocked":
             raise SystemExit("%s is not a --family blocked sweep" % path)
-        if "G_block" in dims:
-            dt, gb = dims["D_tile"], dims["G_block"]
-        else:
-            dt, gb = _tiles(dims["D"], dims["G"])
+        key = _key(dims)
         per_cfg = defaultdict(lambda: defaultdict(dict))  # (k, dtype, dot) -> cfg -> {N: ms}
         ns = set()
         for key0, entries in data["results"].items():
@@ -59,15 +66,15 @@ def main(paths):
                      for c, v in complete.items()}
             cfg = min(score, key=score.get)
             bn, w, st = (int(x) for x in re.match(r"bn(\d+)w(\d+)s(\d+)", cfg).groups())
-            tables[(gb, dt)][kname][(dt_s == "bf16", DOT_LEVEL[dot])] = (bn, w, st)
-    for (gb, dt), kernels in sorted(tables.items()):
-        print("    (%d, %d): {" % (gb, dt))
+            tables[key][kname][(dt_s == "bf16", DOT_LEVEL[dot])] = (bn, w, st)
+    for key, kernels in sorted(tables.items(), key=str):
+        print("    %s: {" % (key,))
         for kname in KERNELS:
             if kname not in kernels:
                 continue
             print("        %r: {" % kname)
-            for key in sorted(kernels[kname]):
-                print("            %r: %r," % (key, kernels[kname][key]))
+            for k in sorted(kernels[kname]):
+                print("            %r: %r," % (k, kernels[kname][k]))
             print("        },")
         print("    },")
 
