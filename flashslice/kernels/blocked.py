@@ -68,7 +68,8 @@ import torch
 import triton
 import triton.language as tl
 
-from .slice_ops import _cfg, _dot, _dot_w, _n_programs, _stages, _strides
+from .slice_ops import (_cfg, _dot, _dot_w, _n_programs, _reduce_parts, _stages,
+                        _strides, _wb_layout)
 
 _BLOCK_G = None  # None = choose from D; set_block_g overrides
 
@@ -204,9 +205,11 @@ def _weights(lg, m, l):
 def _stats_kernel(
     XM, W, BS, TAU, STATS,
     N, G, H,
+    swb, swh, sbb, sbh,
     sxb, sxn, sxh, sxd,
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
+    DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
 ):
     """m[n] = max_g logit[n, g], l[n] = sum_g exp(logit[n, g] - m[n]);
     stored as STATS[b, h, 0, n] and STATS[b, h, 1, n].
@@ -226,8 +229,12 @@ def _stats_kernel(
     bh = tl.program_id(1)
     b = bh // H
     h = bh % H
+    W = W + b.to(tl.int64) * swb + h * swh
+    BS = BS + b.to(tl.int64) * sbb + h * sbh
     offs_d = tl.arange(0, DT)
     dmask = offs_d < D
+    offs_v = tl.arange(0, DVT)
+    vmask = offs_v < DV
     offs_n = pid * BN + tl.arange(0, BN)
     nmask = offs_n < N
     offs_n64 = offs_n.to(tl.int64)
@@ -262,10 +269,12 @@ def _stats_kernel(
 def _slice_fwd_g_kernel(
     XM, FX, W, BS, TAU, STATS, PART_Z, PART_S,
     N, G, P, H,
+    swb, swh, sbb, sbh,
     sxb, sxn, sxh, sxd,
     sfb, sfn, sfh, sfd,
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
+    DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
 ):
     """Owns one G-block, streams over N: z_num[g] = sum_n w[n,g] fx[n],
     s[g] = sum_n w[n,g]. Per-program partials, reduced on the host."""
@@ -274,15 +283,19 @@ def _slice_fwd_g_kernel(
     bh = tl.program_id(2)
     b = bh // H
     h = bh % H
+    W = W + b.to(tl.int64) * swb + h * swh
+    BS = BS + b.to(tl.int64) * sbb + h * sbh
     bh64 = bh.to(tl.int64)
     offs_d = tl.arange(0, DT)
     dmask = offs_d < D
+    offs_v = tl.arange(0, DVT)
+    vmask = offs_v < DV
     offs_g = gblk * GB + tl.arange(0, GB)
     gmask = offs_g < G
     w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
     tau = tl.load(TAU + h).to(tl.float32)
 
-    acc_z = tl.zeros((GB, DT), dtype=tl.float32)
+    acc_z = tl.zeros((GB, DVT), dtype=tl.float32)
     acc_s = tl.zeros((GB,), dtype=tl.float32)
     for start in range(pid * BN, N, P * BN):
         offs_n = start + tl.arange(0, BN)
@@ -296,13 +309,13 @@ def _slice_fwd_g_kernel(
             w = tl.where(nmask[:, None] & gmask[None, :], w, 0.0)
         else:
             w = tl.where(nmask[:, None], w, 0.0)
-        fx = _load_rows(FX, b, h, offs_n64, offs_d, nmask, dmask,
-                        sfb, sfn, sfh, sfd, PAD_D)
+        fx = _load_rows(FX, b, h, offs_n64, offs_v, nmask, vmask,
+                        sfb, sfn, sfh, sfd, PAD_V)
         acc_z += _dot(tl.trans(w), fx, DOT)
         acc_s += tl.sum(w, axis=0)
 
     idx = (bh * P + pid).to(tl.int64)
-    _store_part(PART_Z, acc_z, idx, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
+    _store_part(PART_Z, acc_z, idx, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
     if PAD_G:
         tl.store(PART_S + idx * G + offs_g, acc_s, mask=gmask)
     else:
@@ -313,19 +326,25 @@ def _slice_fwd_g_kernel(
 def _deslice_fwd_n_kernel(
     XM, W, BS, TAU, TOK, STATS, OUT,
     N, G, H,
+    swb, swh, sbb, sbh,
     sxb, sxn, sxh, sxd,
     sob, son, soh, sod,
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
+    DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
 ):
     """Owns one N-block, streams over G: out[n] = sum_g w[n,g] z'[g]."""
     pid = tl.program_id(0)
     bh = tl.program_id(1)
     b = bh // H
     h = bh % H
+    W = W + b.to(tl.int64) * swb + h * swh
+    BS = BS + b.to(tl.int64) * sbb + h * sbh
     bh64 = bh.to(tl.int64)
     offs_d = tl.arange(0, DT)
     dmask = offs_d < D
+    offs_v = tl.arange(0, DVT)
+    vmask = offs_v < DV
     offs_n = pid * BN + tl.arange(0, BN)
     nmask = offs_n < N
     offs_n64 = offs_n.to(tl.int64)
@@ -334,7 +353,7 @@ def _deslice_fwd_n_kernel(
     m, l = _load_stats(STATS, bh64, N, offs_n64)
     tau = tl.load(TAU + h).to(tl.float32)
 
-    acc = tl.zeros((BN, DT), dtype=tl.float32)
+    acc = tl.zeros((BN, DVT), dtype=tl.float32)
     for g0 in range(0, G, GB):
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
@@ -342,10 +361,10 @@ def _deslice_fwd_n_kernel(
         w = _weights(_logits(xm, w_mat, bias, tau, DOT), m, l)
         if PAD_G:
             w = tl.where(gmask[None, :], w, 0.0)
-        tok = _load_tok(TOK, bh64, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
+        tok = _load_tok(TOK, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
         acc += _dot(w, tok, DOT)
-    _store_rows(OUT, acc, b, h, offs_n64, offs_d, nmask, dmask, sob, son, soh, sod,
-                PAD_D)
+    _store_rows(OUT, acc, b, h, offs_n64, offs_v, nmask, vmask, sob, son, soh, sod,
+                PAD_V)
 
 
 @triton.jit
@@ -353,10 +372,12 @@ def _slice_bwd_n_kernel(
     XM, FX, W, BS, TAU, STATS, DZN, DS,
     DXM, DFX, DELTA, PDT,
     N, G, H,
+    swb, swh, sbb, sbh,
     sxb, sxn, sxh, sxd,
     sfb, sfn, sfh, sfd,
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
+    DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
 ):
     """Owns one N-block. Pass 1 over G: dfx = w @ dz_num and the Jacobian
     term delta = sum_g w dw. Pass 2: dxm, and the temperature gradient.
@@ -381,20 +402,24 @@ def _slice_bwd_n_kernel(
     bh = tl.program_id(1)
     b = bh // H
     h = bh % H
+    W = W + b.to(tl.int64) * swb + h * swh
+    BS = BS + b.to(tl.int64) * sbb + h * sbh
     bh64 = bh.to(tl.int64)
     offs_d = tl.arange(0, DT)
     dmask = offs_d < D
+    offs_v = tl.arange(0, DVT)
+    vmask = offs_v < DV
     offs_n = pid * BN + tl.arange(0, BN)
     nmask = offs_n < N
     offs_n64 = offs_n.to(tl.int64)
     xm = _load_rows(XM, b, h, offs_n64, offs_d, nmask, dmask, sxb, sxn, sxh, sxd,
                     PAD_D)
-    fx = _load_rows(FX, b, h, offs_n64, offs_d, nmask, dmask, sfb, sfn, sfh, sfd,
-                    PAD_D)
+    fx = _load_rows(FX, b, h, offs_n64, offs_v, nmask, vmask, sfb, sfn, sfh, sfd,
+                    PAD_V)
     m, l = _load_stats(STATS, bh64, N, offs_n64)
     tau = tl.load(TAU + h).to(tl.float32)
 
-    acc_dfx = tl.zeros((BN, DT), dtype=tl.float32)
+    acc_dfx = tl.zeros((BN, DVT), dtype=tl.float32)
     delta = tl.zeros((BN,), dtype=tl.float32)
     for g0 in range(0, G, GB):
         offs_g = g0 + tl.arange(0, GB)
@@ -403,13 +428,13 @@ def _slice_bwd_n_kernel(
         w = _weights(_logits(xm, w_mat, bias, tau, DOT), m, l)
         if PAD_G:
             w = tl.where(gmask[None, :], w, 0.0)
-        dzn = _load_tok(DZN, bh64, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
+        dzn = _load_tok(DZN, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
         ds = _load_vec(DS + bh64 * G, offs_g, G)
         acc_dfx += _dot(w, dzn, DOT)
         dw = _dot(fx, tl.trans(dzn), DOT) + ds[None, :]
         delta += tl.sum(w * dw, axis=1)
-    _store_rows(DFX, acc_dfx, b, h, offs_n64, offs_d, nmask, dmask,
-                sfb, sfn, sfh, sfd, PAD_D)
+    _store_rows(DFX, acc_dfx, b, h, offs_n64, offs_v, nmask, vmask,
+                sfb, sfn, sfh, sfd, PAD_V)
     tl.store(DELTA + bh64 * N + offs_n64, delta, mask=nmask)
 
     acc_dxm = tl.zeros((BN, DT), dtype=tl.float32)
@@ -422,7 +447,7 @@ def _slice_bwd_n_kernel(
         w = _weights(lg, m, l)
         if PAD_G:
             w = tl.where(gmask[None, :], w, 0.0)
-        dzn = _load_tok(DZN, bh64, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
+        dzn = _load_tok(DZN, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
         ds = _load_vec(DS + bh64 * G, offs_g, G)
         dw = _dot(fx, tl.trans(dzn), DOT) + ds[None, :]
         dl = w * (dw - delta[:, None])
@@ -439,10 +464,12 @@ def _slice_bwd_g_kernel(
     XM, FX, W, BS, TAU, STATS, DELTA, DZN, DS,
     PDW, PDB,
     N, G, P, H,
+    swb, swh, sbb, sbh,
     sxb, sxn, sxh, sxd,
     sfb, sfn, sfh, sfd,
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
+    DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
 ):
     """Owns one G-block, streams over N: partial dW and db."""
     gblk = tl.program_id(0)
@@ -450,14 +477,18 @@ def _slice_bwd_g_kernel(
     bh = tl.program_id(2)
     b = bh // H
     h = bh % H
+    W = W + b.to(tl.int64) * swb + h * swh
+    BS = BS + b.to(tl.int64) * sbb + h * sbh
     bh64 = bh.to(tl.int64)
     offs_d = tl.arange(0, DT)
     dmask = offs_d < D
+    offs_v = tl.arange(0, DVT)
+    vmask = offs_v < DV
     offs_g = gblk * GB + tl.arange(0, GB)
     gmask = offs_g < G
     w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
     tau = tl.load(TAU + h).to(tl.float32)
-    dzn = _load_tok(DZN, bh64, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
+    dzn = _load_tok(DZN, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
     ds = _load_vec(DS + bh64 * G, offs_g, G)
 
     acc_dw = tl.zeros((GB, DT), dtype=tl.float32)
@@ -468,8 +499,8 @@ def _slice_bwd_g_kernel(
         offs_n64 = offs_n.to(tl.int64)
         xm = _load_rows(XM, b, h, offs_n64, offs_d, nmask, dmask,
                         sxb, sxn, sxh, sxd, PAD_D)
-        fx = _load_rows(FX, b, h, offs_n64, offs_d, nmask, dmask,
-                        sfb, sfn, sfh, sfd, PAD_D)
+        fx = _load_rows(FX, b, h, offs_n64, offs_v, nmask, vmask,
+                        sfb, sfn, sfh, sfd, PAD_V)
         m, l = _load_stats(STATS, bh64, N, offs_n64)
         delta = _load_vec(DELTA + bh64 * N, offs_n64, N)
         w = _weights(_logits(xm, w_mat, bias, tau, DOT), m, l)
@@ -495,10 +526,12 @@ def _deslice_bwd_n_kernel(
     XM, W, BS, TAU, TOK, STATS, DOUT,
     DXM, DELTA, PDT,
     N, G, H,
+    swb, swh, sbb, sbh,
     sxb, sxn, sxh, sxd,
     sob, son, soh, sod,
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
+    DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
 ):
     """Owns one N-block. Pass 1 over G: delta = sum_g w (dout . z'[g]) in
     fp32 (recomputed rather than read back from a rounded `out`). Pass 2:
@@ -508,16 +541,20 @@ def _deslice_bwd_n_kernel(
     bh = tl.program_id(1)
     b = bh // H
     h = bh % H
+    W = W + b.to(tl.int64) * swb + h * swh
+    BS = BS + b.to(tl.int64) * sbb + h * sbh
     bh64 = bh.to(tl.int64)
     offs_d = tl.arange(0, DT)
     dmask = offs_d < D
+    offs_v = tl.arange(0, DVT)
+    vmask = offs_v < DV
     offs_n = pid * BN + tl.arange(0, BN)
     nmask = offs_n < N
     offs_n64 = offs_n.to(tl.int64)
     xm = _load_rows(XM, b, h, offs_n64, offs_d, nmask, dmask, sxb, sxn, sxh, sxd,
                     PAD_D)
-    dout = _load_rows(DOUT, b, h, offs_n64, offs_d, nmask, dmask, sob, son, soh,
-                      sod, PAD_D)
+    dout = _load_rows(DOUT, b, h, offs_n64, offs_v, nmask, vmask, sob, son, soh,
+                      sod, PAD_V)
     m, l = _load_stats(STATS, bh64, N, offs_n64)
     tau = tl.load(TAU + h).to(tl.float32)
 
@@ -529,7 +566,7 @@ def _deslice_bwd_n_kernel(
         w = _weights(_logits(xm, w_mat, bias, tau, DOT), m, l)
         if PAD_G:
             w = tl.where(gmask[None, :], w, 0.0)
-        tok = _load_tok(TOK, bh64, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
+        tok = _load_tok(TOK, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
         delta += tl.sum(w * _dot(dout, tl.trans(tok), DOT), axis=1)
     tl.store(DELTA + bh64 * N + offs_n64, delta, mask=nmask)
 
@@ -543,7 +580,7 @@ def _deslice_bwd_n_kernel(
         w = _weights(lg, m, l)
         if PAD_G:
             w = tl.where(gmask[None, :], w, 0.0)
-        tok = _load_tok(TOK, bh64, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
+        tok = _load_tok(TOK, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
         dw = _dot(dout, tl.trans(tok), DOT)
         dl = w * (dw - delta[:, None])
         acc_dxm += _dot(dl / tau, w_mat, DOT)
@@ -559,10 +596,12 @@ def _deslice_bwd_g_kernel(
     XM, W, BS, TAU, TOK, STATS, DELTA, DOUT,
     PDTOK, PDW, PDB,
     N, G, P, H,
+    swb, swh, sbb, sbh,
     sxb, sxn, sxh, sxd,
     sob, son, soh, sod,
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
+    DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
 ):
     """Owns one G-block, streams over N: partial dz', dW and db."""
     gblk = tl.program_id(0)
@@ -570,16 +609,20 @@ def _deslice_bwd_g_kernel(
     bh = tl.program_id(2)
     b = bh // H
     h = bh % H
+    W = W + b.to(tl.int64) * swb + h * swh
+    BS = BS + b.to(tl.int64) * sbb + h * sbh
     bh64 = bh.to(tl.int64)
     offs_d = tl.arange(0, DT)
     dmask = offs_d < D
+    offs_v = tl.arange(0, DVT)
+    vmask = offs_v < DV
     offs_g = gblk * GB + tl.arange(0, GB)
     gmask = offs_g < G
     w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
     tau = tl.load(TAU + h).to(tl.float32)
-    tok = _load_tok(TOK, bh64, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
+    tok = _load_tok(TOK, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
 
-    acc_dtok = tl.zeros((GB, DT), dtype=tl.float32)
+    acc_dtok = tl.zeros((GB, DVT), dtype=tl.float32)
     acc_dw = tl.zeros((GB, DT), dtype=tl.float32)
     acc_db = tl.zeros((GB,), dtype=tl.float32)
     for start in range(pid * BN, N, P * BN):
@@ -588,8 +631,8 @@ def _deslice_bwd_g_kernel(
         offs_n64 = offs_n.to(tl.int64)
         xm = _load_rows(XM, b, h, offs_n64, offs_d, nmask, dmask,
                         sxb, sxn, sxh, sxd, PAD_D)
-        dout = _load_rows(DOUT, b, h, offs_n64, offs_d, nmask, dmask,
-                          sob, son, soh, sod, PAD_D)
+        dout = _load_rows(DOUT, b, h, offs_n64, offs_v, nmask, vmask,
+                          sob, son, soh, sod, PAD_V)
         m, l = _load_stats(STATS, bh64, N, offs_n64)
         delta = _load_vec(DELTA + bh64 * N, offs_n64, N)
         w = _weights(_logits(xm, w_mat, bias, tau, DOT), m, l)
@@ -604,8 +647,8 @@ def _deslice_bwd_g_kernel(
         acc_db += tl.sum(dlr, axis=0)
 
     idx = (bh * P + pid).to(tl.int64)
-    _store_part(PDTOK, acc_dtok, idx, offs_g, offs_d, gmask, dmask, G, D,
-                PAD_G, PAD_D)
+    _store_part(PDTOK, acc_dtok, idx, offs_g, offs_v, gmask, vmask, G, DV,
+                PAD_G, PAD_V)
     _store_part(PDW, acc_dw, idx, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
     if PAD_G:
         tl.store(PDB + idx * G + offs_g, acc_db, mask=gmask)
@@ -789,15 +832,20 @@ def _launch_cfg(kernel, t, dot, gb, dt):
     return bn, warps, stages
 
 
-def _consts(D, G, dt, gb, bn, dot, warps, stages):
-    """The constexpr and launch keyword arguments of every blocked kernel."""
+def _consts(D, G, dt, gb, bn, dot, warps, stages, dv=None):
+    """The constexpr and launch keyword arguments of every blocked kernel.
+    ``dv`` is the value width (fx_mid, tokens, out); None means it equals the
+    logits width D of x_mid and the weight."""
+    dv = D if dv is None else dv
+    dvt = _pow2_at_least_16(dv)
     return dict(D=D, DT=dt, GB=gb, BN=bn, DOT=dot, PAD_G=(G % gb != 0),
-                PAD_D=(dt != D), num_warps=warps, num_stages=stages)
+                PAD_D=(dt != D), DV=dv, DVT=dvt, PAD_V=(dvt != dv),
+                num_warps=warps, num_stages=stages)
 
 
 def _bh_dims(x_mid, weight):
     B, N, H, D = x_mid.shape
-    return B, N, H, D, weight.shape[0]
+    return B, N, H, D, weight.shape[-2]
 
 
 def compute_stats(x_mid, weight, bias, tau, dot=0):
@@ -807,9 +855,11 @@ def compute_stats(x_mid, weight, bias, tau, dot=0):
     dt, gb = tiles(D, G)
     bn, warps, stages = _launch_cfg("stats", x_mid, dot, gb, dt)
     stats = torch.empty(B, H, 2, N, device=x_mid.device, dtype=torch.float32)
+    weight, bias, tau = weight.contiguous(), bias.contiguous(), tau.contiguous()
+    wb = _wb_layout(weight, bias, B, H)
     _stats_kernel[(triton.cdiv(N, bn), B * H)](
-        x_mid, weight.contiguous(), bias.contiguous(), tau.contiguous(), stats,
-        N, G, H, *_strides(x_mid),
+        x_mid, weight, bias, tau, stats,
+        N, G, H, *wb, *_strides(x_mid),
         **_consts(D, G, dt, gb, bn, dot, warps, stages))
     return stats
 
@@ -817,19 +867,21 @@ def compute_stats(x_mid, weight, bias, tau, dot=0):
 def _slice_blk_impl(x_mid, fx_mid, weight, bias, tau, dot):
     B, N, H, D, G = _bh_dims(x_mid, weight)
     weight, bias, tau = weight.contiguous(), bias.contiguous(), tau.contiguous()
+    wb = _wb_layout(weight, bias, B, H)
     stats = compute_stats(x_mid, weight, bias, tau, dot)
     dt, gb = tiles(D, G)
     ngb = triton.cdiv(G, gb)
     bn, warps, stages = _launch_cfg("slice_fwd_g", x_mid, dot, gb, dt)
     P = _n_programs(N, B * H * ngb, bn)
-    part_z = torch.empty(B * H * P, G, D, device=x_mid.device,
+    DV = fx_mid.shape[3]
+    part_z = torch.empty(B * H * P, G, DV, device=x_mid.device,
                          dtype=torch.float32)
     part_s = torch.empty(B * H * P, G, device=x_mid.device, dtype=torch.float32)
     _slice_fwd_g_kernel[(ngb, P, B * H)](
         x_mid, fx_mid, weight, bias, tau, stats, part_z, part_s,
-        N, G, P, H, *_strides(x_mid), *_strides(fx_mid),
-        **_consts(D, G, dt, gb, bn, dot, warps, stages))
-    return (part_z.view(B, H, P, G, D).sum(2), part_s.view(B, H, P, G).sum(2),
+        N, G, P, H, *wb, *_strides(x_mid), *_strides(fx_mid),
+        **_consts(D, G, dt, gb, bn, dot, warps, stages, DV))
+    return (part_z.view(B, H, P, G, DV).sum(2), part_s.view(B, H, P, G).sum(2),
             stats)
 
 
@@ -837,6 +889,7 @@ def _slice_blk_bwd_impl(x_mid, fx_mid, weight, bias, tau, stats, dz_num, ds,
                         dot):
     B, N, H, D, G = _bh_dims(x_mid, weight)
     weight, bias, tau = weight.contiguous(), bias.contiguous(), tau.contiguous()
+    wb = _wb_layout(weight, bias, B, H)
     stats = stats.contiguous()
     dz_num = dz_num.contiguous().float()
     ds = ds.contiguous().float()
@@ -848,10 +901,11 @@ def _slice_blk_bwd_impl(x_mid, fx_mid, weight, bias, tau, stats, dz_num, ds,
     bn, warps, stages = _launch_cfg("slice_bwd_n", x_mid, dot, gb, dt)
     nprog = triton.cdiv(N, bn)
     pdt = torch.empty(B * H * nprog, device=x_mid.device, dtype=torch.float32)
+    DV = fx_mid.shape[3]
     _slice_bwd_n_kernel[(nprog, B * H)](
         x_mid, fx_mid, weight, bias, tau, stats, dz_num, ds, dxm, dfx, delta,
-        pdt, N, G, H, *_strides(x_mid), *_strides(fx_mid),
-        **_consts(D, G, dt, gb, bn, dot, warps, stages))
+        pdt, N, G, H, *wb, *_strides(x_mid), *_strides(fx_mid),
+        **_consts(D, G, dt, gb, bn, dot, warps, stages, DV))
     bn, warps, stages = _launch_cfg("slice_bwd_g", x_mid, dot, gb, dt)
     P = _n_programs(N, B * H * ngb, bn)
     pdw = torch.empty(B * H * P, G, D, device=x_mid.device, dtype=torch.float32)
@@ -859,33 +913,36 @@ def _slice_blk_bwd_impl(x_mid, fx_mid, weight, bias, tau, stats, dz_num, ds,
     _slice_bwd_g_kernel[(ngb, P, B * H)](
         x_mid, fx_mid, weight, bias, tau, stats, delta, dz_num, ds,
         pdw, pdb,
-        N, G, P, H, *_strides(x_mid), *_strides(fx_mid),
-        **_consts(D, G, dt, gb, bn, dot, warps, stages))
-    return (dxm, dfx, pdw.sum(0), pdb.sum(0),
-            pdt.view(B, H, nprog).sum(dim=(0, 2)))
+        N, G, P, H, *wb, *_strides(x_mid), *_strides(fx_mid),
+        **_consts(D, G, dt, gb, bn, dot, warps, stages, DV))
+    dw, db = _reduce_parts(pdw, pdb, B, H, P, weight, bias)
+    return dxm, dfx, dw, db, pdt.view(B, H, nprog).sum(dim=(0, 2))
 
 
 def _deslice_blk_impl(x_mid, weight, bias, tau, tokens, stats, dot):
     B, N, H, D, G = _bh_dims(x_mid, weight)
     weight, bias, tau = weight.contiguous(), bias.contiguous(), tau.contiguous()
+    wb = _wb_layout(weight, bias, B, H)
     tokens = tokens.contiguous()
     if stats is None:
         stats = compute_stats(x_mid, weight, bias, tau, dot)
     else:
         stats = stats.contiguous()
     dt, gb = tiles(D, G)
-    out = torch.empty(B, N, H, D, device=x_mid.device, dtype=x_mid.dtype)
+    DV = tokens.shape[3]
+    out = torch.empty(B, N, H, DV, device=x_mid.device, dtype=x_mid.dtype)
     bn, warps, stages = _launch_cfg("deslice_fwd_n", x_mid, dot, gb, dt)
     _deslice_fwd_n_kernel[(triton.cdiv(N, bn), B * H)](
         x_mid, weight, bias, tau, tokens, stats, out,
-        N, G, H, *_strides(x_mid), *_strides(out),
-        **_consts(D, G, dt, gb, bn, dot, warps, stages))
+        N, G, H, *wb, *_strides(x_mid), *_strides(out),
+        **_consts(D, G, dt, gb, bn, dot, warps, stages, DV))
     return out, stats
 
 
 def _deslice_blk_bwd_impl(x_mid, weight, bias, tau, tokens, stats, d_out, dot):
     B, N, H, D, G = _bh_dims(x_mid, weight)
     weight, bias, tau = weight.contiguous(), bias.contiguous(), tau.contiguous()
+    wb = _wb_layout(weight, bias, B, H)
     tokens = tokens.contiguous()
     d_out = d_out.contiguous()
     stats = stats.contiguous()
@@ -896,23 +953,25 @@ def _deslice_blk_bwd_impl(x_mid, weight, bias, tau, tokens, stats, d_out, dot):
     bn, warps, stages = _launch_cfg("deslice_bwd_n", x_mid, dot, gb, dt)
     nprog = triton.cdiv(N, bn)
     pdt = torch.empty(B * H * nprog, device=x_mid.device, dtype=torch.float32)
+    DV = tokens.shape[3]
     _deslice_bwd_n_kernel[(nprog, B * H)](
         x_mid, weight, bias, tau, tokens, stats, d_out, dxm, delta, pdt,
-        N, G, H, *_strides(x_mid), *_strides(d_out),
-        **_consts(D, G, dt, gb, bn, dot, warps, stages))
+        N, G, H, *wb, *_strides(x_mid), *_strides(d_out),
+        **_consts(D, G, dt, gb, bn, dot, warps, stages, DV))
     bn, warps, stages = _launch_cfg("deslice_bwd_g", x_mid, dot, gb, dt)
     P = _n_programs(N, B * H * ngb, bn)
-    pdtok = torch.empty(B * H * P, G, D, device=x_mid.device,
+    pdtok = torch.empty(B * H * P, G, DV, device=x_mid.device,
                         dtype=torch.float32)
     pdw = torch.empty(B * H * P, G, D, device=x_mid.device, dtype=torch.float32)
     pdb = torch.empty(B * H * P, G, device=x_mid.device, dtype=torch.float32)
     _deslice_bwd_g_kernel[(ngb, P, B * H)](
         x_mid, weight, bias, tau, tokens, stats, delta, d_out,
         pdtok, pdw, pdb,
-        N, G, P, H, *_strides(x_mid), *_strides(d_out),
-        **_consts(D, G, dt, gb, bn, dot, warps, stages))
-    return (dxm, pdtok.view(B, H, P, G, D).sum(2).to(tokens.dtype),
-            pdw.sum(0), pdb.sum(0), pdt.view(B, H, nprog).sum(dim=(0, 2)))
+        N, G, P, H, *wb, *_strides(x_mid), *_strides(d_out),
+        **_consts(D, G, dt, gb, bn, dot, warps, stages, DV))
+    dw, db = _reduce_parts(pdw, pdb, B, H, P, weight, bias)
+    return (dxm, pdtok.view(B, H, P, G, DV).sum(2).to(tokens.dtype),
+            dw, db, pdt.view(B, H, nprog).sum(dim=(0, 2)))
 
 
 # --------------------------------------------------------------------------- #
@@ -948,8 +1007,8 @@ torch.library.impl("flashslice::deslice_blk_bwd", "CUDA", _deslice_blk_bwd_impl)
 @torch.library.register_fake("flashslice::slice_blk")
 def _(x_mid, fx_mid, weight, bias, tau, dot):
     B, N, H, D = x_mid.shape
-    G = weight.shape[0]
-    return (x_mid.new_empty((B, H, G, D), dtype=torch.float32),
+    G = weight.shape[-2]
+    return (x_mid.new_empty((B, H, G, fx_mid.shape[3]), dtype=torch.float32),
             x_mid.new_empty((B, H, G), dtype=torch.float32),
             x_mid.new_empty((B, H, 2, N), dtype=torch.float32))
 
@@ -964,7 +1023,7 @@ def _(x_mid, fx_mid, weight, bias, tau, stats, dz_num, ds, dot):
 @torch.library.register_fake("flashslice::deslice_blk")
 def _(x_mid, weight, bias, tau, tokens, stats, dot):
     B, N, H, D = x_mid.shape
-    return (x_mid.new_empty((B, N, H, D)),
+    return (x_mid.new_empty((B, N, H, tokens.shape[3])),
             x_mid.new_empty((B, H, 2, N), dtype=torch.float32))
 
 

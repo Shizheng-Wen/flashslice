@@ -213,14 +213,22 @@ def set_kernel_mode(mode):
     _KERNEL_MODE = mode
 
 
-def single_tile_dims(d, g):
+def single_tile_dims(d, g, dv=None):
     """True when the tuned single-tile kernels serve (D, G): both powers of
-    two in [16, 128]. The blocked kernels serve everything else."""
+    two in [16, 128], and the value width ``dv`` (fx_mid, tokens) equal to
+    the logits width D. The blocked kernels serve everything else."""
+    if dv is not None and dv != d:
+        return False
     return all(16 <= v <= 128 and (v & (v - 1)) == 0 for v in (d, g))
 
 
-def unsupported_dims(d, g):
+def unsupported_dims(d, g, dv=None):
     """Why the fused kernels cannot serve these dims, or None if they can.
+
+    ``d`` is the logits width (x_mid and the slice weight), ``dv`` the value
+    width (fx_mid, tokens, out); None means equal. The two may differ — a
+    membership path that carries extra positional channels next to a
+    narrower value path — and then the blocked kernels serve the shape.
 
     Two regimes. The single-tile kernels in this file hold the whole head
     width D and slice count G in one tile each (that is what lets the softmax
@@ -233,27 +241,31 @@ def unsupported_dims(d, g):
     if not 1 <= d <= _D_MAX:
         return ("dim_head=%d is outside the fused kernels' supported range "
                 "[1, %d]" % (d, _D_MAX))
+    if dv is not None and not 1 <= dv <= _D_MAX:
+        return ("value width %d is outside the fused kernels' supported range "
+                "[1, %d]" % (dv, _D_MAX))
     if g < 1:
         return "slice_num=%d is not a positive slice count" % g
     return None
 
 
-def _check_dims(d, g):
-    why = unsupported_dims(d, g)
+def _check_dims(d, g, dv=None):
+    why = unsupported_dims(d, g, dv)
     if why:
         raise ValueError("fused_slice: " + why)
 
 
-def _use_blocked(d, g):
+def _use_blocked(d, g, dv=None):
     """Route a shape: False = the single-tile kernels here, True = blocked."""
     if _KERNEL_MODE == "blocked":
         return True
     if _KERNEL_MODE == "single-tile":
-        if not single_tile_dims(d, g):
+        if not single_tile_dims(d, g, dv):
             raise ValueError("kernel mode 'single-tile' cannot serve dim_head=%d, "
-                             "slice_num=%d (powers of two in [16, 128])" % (d, g))
+                             "slice_num=%d, value width %s (powers of two in "
+                             "[16, 128], equal widths)" % (d, g, dv))
         return False
-    return not single_tile_dims(d, g)
+    return not single_tile_dims(d, g, dv)
 
 
 def _n_programs(n, bh, block_n):
@@ -262,6 +274,80 @@ def _n_programs(n, bh, block_n):
 
 def _strides(t):
     return t.stride(0), t.stride(1), t.stride(2), t.stride(3)
+
+
+def _lead2(t, trailing):
+    """(batch, heads) extent of a weight-like tensor's leading dims: 1 where
+    the dim is absent. ``trailing`` is how many trailing dims are not lead."""
+    return ((1, 1) + tuple(t.shape[:-trailing]))[-2:]
+
+
+def _wb_layout(weight, bias, B, H):
+    """Element strides of a contiguous weight (.., G, D) and bias (.., G)
+    along the batch and head axes of x_mid: zero wherever the tensor is
+    shared along that axis. Leading dims read from the right: heads, then
+    batch — (G, D) is shared by everything, (H, G, D) is per head,
+    (B, H, G, D) per batch and head (token-conditioned slices)."""
+    assert weight.is_contiguous() and bias.is_contiguous()
+    G, D = weight.shape[-2:]
+    Bw, Hw = _lead2(weight, 2)
+    Bb, Hb = _lead2(bias, 1)
+    for name, got in (("weight", (Bw, Hw)), ("bias", (Bb, Hb))):
+        if got[0] not in (1, B) or got[1] not in (1, H):
+            raise ValueError("%s has (batch, heads) = %s, x_mid has (%d, %d)"
+                             % (name, got, B, H))
+    if bias.shape[-1] != G:
+        raise ValueError("bias has %d slices, weight %d" % (bias.shape[-1], G))
+    return (Hw * G * D if Bw > 1 else 0, G * D if Hw > 1 else 0,
+            Hb * G if Bb > 1 else 0, G if Hb > 1 else 0)
+
+
+def _reduce_parts(pdw, pdb, B, H, P, weight, bias):
+    """Per-program partial dW (B*H*P, G, D) and db (B*H*P, G) summed into
+    the weight's and bias's own shapes: over the P programs of each (b, h),
+    and over the batch or head axis wherever the tensor is shared along it.
+    Deterministic (.sum, no atomics), returned in the parameter's dtype."""
+    G, D = weight.shape[-2:]
+    dw = pdw.view(B, H, P, G, D).sum(2)
+    db = pdb.view(B, H, P, G).sum(2)
+    Bw, Hw = _lead2(weight, 2)
+    Bb, Hb = _lead2(bias, 1)
+    if Bw == 1:
+        dw = dw.sum(0, keepdim=True)
+    if Hw == 1:
+        dw = dw.sum(1, keepdim=True)
+    if Bb == 1:
+        db = db.sum(0, keepdim=True)
+    if Hb == 1:
+        db = db.sum(1, keepdim=True)
+    return (dw.reshape(weight.shape).to(weight.dtype),
+            db.reshape(bias.shape).to(bias.dtype))
+
+
+def _prep_wb(x_mid, weight, bias):
+    """Validate weight (G, D) | (H, G, D) | (B, H, G, D) and bias None | (G,)
+    | (H, G) | (B, H, G) against x_mid (B, N, H, D); a None bias becomes
+    zeros (G,). Returns (weight, bias, G)."""
+    B, N, H, D = x_mid.shape
+    if weight.dim() not in (2, 3, 4):
+        raise ValueError("weight must be (G, D), (H, G, D) or (B, H, G, D), "
+                         "got shape %s" % (tuple(weight.shape),))
+    G = weight.shape[-2]
+    if weight.shape[-1] != D:
+        raise ValueError("weight's last dim is %d, x_mid's head width is %d"
+                         % (weight.shape[-1], D))
+    if bias is None:
+        bias = weight.new_zeros(G)
+    elif bias.dim() not in (1, 2, 3) or bias.shape[-1] != G:
+        raise ValueError("bias must be (G,), (H, G) or (B, H, G) with G=%d, "
+                         "got shape %s" % (G, tuple(bias.shape)))
+    for name, t, trailing in (("weight", weight, 2), ("bias", bias, 1)):
+        for got, want, axis in zip(tuple(t.shape[:-trailing])[::-1], (H, B),
+                                   ("heads", "batch")):
+            if got not in (1, want):
+                raise ValueError("%s has %d along %s, x_mid has %d"
+                                 % (name, got, axis, want))
+    return weight, bias, G
 
 
 # --------------------------------------------------------------------------- #
@@ -293,6 +379,7 @@ def _dot_w(a, b, DOT: tl.constexpr):
 def _slice_fwd_kernel(
     XM, FX, W, BS, TAU, PART_Z, PART_S,
     N, P, H,
+    swb, swh, sbb, sbh,
     sxb, sxn, sxh, sxd,
     sfb, sfn, sfh, sfd,
     D: tl.constexpr, G: tl.constexpr, BN: tl.constexpr, DOT: tl.constexpr,
@@ -301,6 +388,8 @@ def _slice_fwd_kernel(
     bh = tl.program_id(1)
     b = bh // H
     h = bh % H
+    W = W + b.to(tl.int64) * swb + h * swh
+    BS = BS + b.to(tl.int64) * sbb + h * sbh
     offs_d = tl.arange(0, D)
     offs_g = tl.arange(0, G)
 
@@ -338,6 +427,7 @@ def _slice_fwd_kernel(
 def _deslice_fwd_kernel(
     XM, W, BS, TAU, TOK, OUT,
     N, H,
+    swb, swh, sbb, sbh,
     sxb, sxn, sxh, sxd,
     sob, son, soh, sod,
     D: tl.constexpr, G: tl.constexpr, BN: tl.constexpr, DOT: tl.constexpr,
@@ -346,6 +436,8 @@ def _deslice_fwd_kernel(
     bh = tl.program_id(1)
     b = bh // H
     h = bh % H
+    W = W + b.to(tl.int64) * swb + h * swh
+    BS = BS + b.to(tl.int64) * sbb + h * sbh
     offs_d = tl.arange(0, D)
     offs_g = tl.arange(0, G)
 
@@ -377,6 +469,7 @@ def _slice_bwd_kernel(
     XM, FX, W, BS, TAU, DZN, DS,
     DXM, DFX, PDW, PDB, PDT,
     N, P, H,
+    swb, swh, sbb, sbh,
     sxb, sxn, sxh, sxd,
     sfb, sfn, sfh, sfd,
     D: tl.constexpr, G: tl.constexpr, BN: tl.constexpr, DOT: tl.constexpr,
@@ -385,6 +478,8 @@ def _slice_bwd_kernel(
     bh = tl.program_id(1)
     b = bh // H
     h = bh % H
+    W = W + b.to(tl.int64) * swb + h * swh
+    BS = BS + b.to(tl.int64) * sbb + h * sbh
     offs_d = tl.arange(0, D)
     offs_g = tl.arange(0, G)
 
@@ -444,6 +539,7 @@ def _deslice_bwd_kernel(
     XM, W, BS, TAU, TOK, DOUT,
     DXM, PDTOK, PDW, PDB, PDT,
     N, P, H,
+    swb, swh, sbb, sbh,
     sxb, sxn, sxh, sxd,
     sob, son, soh, sod,
     D: tl.constexpr, G: tl.constexpr, BN: tl.constexpr, DOT: tl.constexpr,
@@ -452,6 +548,8 @@ def _deslice_bwd_kernel(
     bh = tl.program_id(1)
     b = bh // H
     h = bh % H
+    W = W + b.to(tl.int64) * swb + h * swh
+    BS = BS + b.to(tl.int64) * sbb + h * sbh
     offs_d = tl.arange(0, D)
     offs_g = tl.arange(0, G)
 
@@ -529,8 +627,9 @@ _LIB.define(
 
 def _slice_impl(x_mid, fx_mid, weight, bias, tau, dot):
     B, N, H, D = x_mid.shape
-    G = weight.shape[0]
+    G = weight.shape[-2]
     weight, bias, tau = weight.contiguous(), bias.contiguous(), tau.contiguous()
+    wb = _wb_layout(weight, bias, B, H)
     bn, warps, stages = _cfg("slice_fwd", x_mid, dot, G, D)
     stages = _stages(dot, stages)
     P = _n_programs(N, B * H, bn)
@@ -539,14 +638,16 @@ def _slice_impl(x_mid, fx_mid, weight, bias, tau, dot):
     part_s = torch.empty(B * H * P, G, device=x_mid.device, dtype=torch.float32)
     _slice_fwd_kernel[(P, B * H)](
         x_mid, fx_mid, weight, bias, tau, part_z, part_s,
-        N, P, H, *_strides(x_mid), *_strides(fx_mid),
+        N, P, H, *wb, *_strides(x_mid), *_strides(fx_mid),
         D=D, G=G, BN=bn, DOT=dot, num_warps=warps, num_stages=stages)
     return part_z.view(B, H, P, G, D).sum(2), part_s.view(B, H, P, G).sum(2)
 
 
 def _slice_bwd_impl(x_mid, fx_mid, weight, bias, tau, dz_num, ds, dot):
     B, N, H, D = x_mid.shape
-    G = weight.shape[0]
+    G = weight.shape[-2]
+    weight, bias, tau = weight.contiguous(), bias.contiguous(), tau.contiguous()
+    wb = _wb_layout(weight, bias, B, H)
     dz_num = dz_num.contiguous().float()
     ds = ds.contiguous().float()
     dxm = torch.empty_like(x_mid)
@@ -560,29 +661,33 @@ def _slice_bwd_impl(x_mid, fx_mid, weight, bias, tau, dz_num, ds, dot):
     _slice_bwd_kernel[(P, B * H)](
         x_mid, fx_mid, weight, bias, tau, dz_num, ds,
         dxm, dfx, pdw, pdb, pdt,
-        N, P, H, *_strides(x_mid), *_strides(fx_mid),
+        N, P, H, *wb, *_strides(x_mid), *_strides(fx_mid),
         D=D, G=G, BN=bn, DOT=dot, num_warps=warps, num_stages=stages)
-    return dxm, dfx, pdw.sum(0), pdb.sum(0), pdt.view(B, H, P).sum(dim=(0, 2))
+    dw, db = _reduce_parts(pdw, pdb, B, H, P, weight, bias)
+    return dxm, dfx, dw, db, pdt.view(B, H, P).sum(dim=(0, 2))
 
 
 def _deslice_impl(x_mid, weight, bias, tau, tokens, dot):
     B, N, H, D = x_mid.shape
-    G = weight.shape[0]
+    G = weight.shape[-2]
     weight, bias, tau = weight.contiguous(), bias.contiguous(), tau.contiguous()
+    wb = _wb_layout(weight, bias, B, H)
     tokens = tokens.contiguous()
     out = torch.empty(B, N, H, D, device=x_mid.device, dtype=x_mid.dtype)
     bn, warps, stages = _cfg("deslice_fwd", x_mid, dot, G, D)
     grid = (triton.cdiv(N, bn), B * H)
     _deslice_fwd_kernel[grid](
         x_mid, weight, bias, tau, tokens, out,
-        N, H, *_strides(x_mid), *_strides(out),
+        N, H, *wb, *_strides(x_mid), *_strides(out),
         D=D, G=G, BN=bn, DOT=dot, num_warps=warps, num_stages=stages)
     return out
 
 
 def _deslice_bwd_impl(x_mid, weight, bias, tau, tokens, d_out, dot):
     B, N, H, D = x_mid.shape
-    G = weight.shape[0]
+    G = weight.shape[-2]
+    weight, bias, tau = weight.contiguous(), bias.contiguous(), tau.contiguous()
+    wb = _wb_layout(weight, bias, B, H)
     tokens = tokens.contiguous()
     d_out = d_out.contiguous()
     dxm = torch.empty_like(x_mid)
@@ -597,10 +702,11 @@ def _deslice_bwd_impl(x_mid, weight, bias, tau, tokens, d_out, dot):
     _deslice_bwd_kernel[(P, B * H)](
         x_mid, weight, bias, tau, tokens, d_out,
         dxm, pdtok, pdw, pdb, pdt,
-        N, P, H, *_strides(x_mid), *_strides(d_out),
+        N, P, H, *wb, *_strides(x_mid), *_strides(d_out),
         D=D, G=G, BN=bn, DOT=dot, num_warps=warps, num_stages=stages)
+    dw, db = _reduce_parts(pdw, pdb, B, H, P, weight, bias)
     return (dxm, pdtok.view(B, H, P, G, D).sum(2).to(tokens.dtype),
-            pdw.sum(0), pdb.sum(0), pdt.view(B, H, P).sum(dim=(0, 2)))
+            dw, db, pdt.view(B, H, P).sum(dim=(0, 2)))
 
 
 _LIB.impl("flash_slice", _slice_impl, "CUDA")
@@ -612,7 +718,7 @@ _LIB.impl("flash_deslice_bwd", _deslice_bwd_impl, "CUDA")
 @torch.library.register_fake("flashslice::flash_slice")
 def _(x_mid, fx_mid, weight, bias, tau, dot):
     B, N, H, D = x_mid.shape
-    G = weight.shape[0]
+    G = weight.shape[-2]
     return (x_mid.new_empty((B, H, G, D), dtype=torch.float32),
             x_mid.new_empty((B, H, G), dtype=torch.float32))
 
@@ -677,9 +783,20 @@ torch.library.register_autograd("flashslice::flash_deslice", _deslice_grad,
 # --------------------------------------------------------------------------- #
 
 def fused_slice(x_mid, fx_mid, weight, bias, tau, return_stats=False):
-    """x_mid, fx_mid: (B, N, H, D); weight: (G, D); bias: (G,); tau: (H,).
-    Returns fp32 z_num (B, H, G, D) and s (B, H, G); normalize outside as
+    """x_mid: (B, N, H, D); fx_mid: (B, N, H, DV); weight: (G, D), (H, G, D)
+    or (B, H, G, D); bias: None, (G,), (H, G) or (B, H, G); tau: (H,).
+    Returns fp32 z_num (B, H, G, DV) and s (B, H, G); normalize outside as
     z = z_num / (s + eps)[..., None].
+
+    The logits width D (x_mid, weight) and the value width DV (fx_mid, and
+    the tokens of the deslice) may differ; unequal widths take the blocked
+    kernels. Both are at most 256.
+
+    A weight with head or batch dims gives every head (and sample) its own
+    slice projection — the token-conditioned case, weight = k(tokens) — and
+    its gradient comes back in the same shape, flowing on to whatever
+    produced it. The kernels read the weight through strides, so the shape
+    costs nothing; a non-contiguous weight is copied once per call.
 
     With ``return_stats=True`` a third value is returned: on the blocked path
     the per-point softmax statistics of the slice logits — row max and sum of
@@ -687,10 +804,11 @@ def fused_slice(x_mid, fx_mid, weight, bias, tau, return_stats=False):
     reuse when it shares the slice weights (the tied case); on the
     single-tile path, which never forms them, ``None``. Either value is
     accepted by ``fused_deslice``."""
-    D, G = x_mid.shape[3], weight.shape[0]
-    _check_dims(D, G)
+    weight, bias, G = _prep_wb(x_mid, weight, bias)
+    D, DV = x_mid.shape[3], fx_mid.shape[3]
+    _check_dims(D, G, DV)
     dot = _dot_mode(x_mid)
-    if _use_blocked(D, G):
+    if _use_blocked(D, G, DV):
         z_num, s, stats = torch.ops.flashslice.slice_blk(
             x_mid, fx_mid, weight, bias, tau, dot)
         return (z_num, s, stats.detach()) if return_stats else (z_num, s)
@@ -700,17 +818,19 @@ def fused_slice(x_mid, fx_mid, weight, bias, tau, return_stats=False):
 
 
 def fused_deslice(x_mid, weight, bias, tau, tokens, stats=None):
-    """tokens: (B, H, G, D) mixed tokens z'. Returns out (B, N, H, D) in
+    """tokens: (B, H, G, DV) mixed tokens z'. Returns out (B, N, H, DV) in
     x_mid's dtype — already in the layout to_out expects after a reshape.
+    weight and bias take the shapes ``fused_slice`` documents.
 
     ``stats`` is what ``fused_slice(..., return_stats=True)`` returned for
     the *same* x_mid, weight, bias and tau; pass it to skip recomputing it,
     or leave it None (always None for untied deslice, whose weights differ).
     The single-tile path ignores it."""
-    D, G = x_mid.shape[3], weight.shape[0]
-    _check_dims(D, G)
+    weight, bias, G = _prep_wb(x_mid, weight, bias)
+    D, DV = x_mid.shape[3], tokens.shape[3]
+    _check_dims(D, G, DV)
     dot = _dot_mode(x_mid)
-    if _use_blocked(D, G):
+    if _use_blocked(D, G, DV):
         out, _ = torch.ops.flashslice.deslice_blk(x_mid, weight, bias, tau,
                                                   tokens, stats, dot)
         return out
