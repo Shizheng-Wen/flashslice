@@ -15,9 +15,10 @@ FlashAttention-2's *backward* does, not the way its forward does:
   That is two floats per point and head, 2/G of the tensor the eager path
   stores, and it is kept for the backward.
 * Every other kernel recomputes ``w[n, g] = exp(logit[n, g] - m[n]) / l[n]``
-  one G-block at a time. The kernels that own points form the row sum they
-  divide by themselves, from the very exponentials they use (it costs one
-  reduction per block); the kernels that own slots take the saved ``l``.
+  one G-block at a time. The backward kernels that own points form the row
+  sum they divide by themselves, from the very exponentials they use (one
+  reduction per block; ``set_own_row_sum(False)`` makes them take the saved
+  ``l`` instead); the forward and the slot-owning kernels take the saved ``l``.
 * Quantities indexed by g (tokens, dW, db, dz') come from programs that own
   a G-block and stream over N; quantities indexed by n (out, dxm, dfx) from
   programs that own an N-block and stream over G. The softmax Jacobian in
@@ -118,10 +119,13 @@ def stats_mode():
 
 
 # Whether the backward kernels that own points form the row sum they
-# normalize with themselves (True) or take the saved l (False). Both are held
-# to the parity gate; the switch attributes a difference and costs one
-# reduction per G-block in pass 1 when on.
-_OWN_L = (os.environ.get("FLASHSLICE_OWN_L", "1").lower() not in ("0", "false", "off"))
+# normalize with themselves (True) or take the saved l (False, default). Both
+# are held to the parity gate; the switch attributes a difference. On costs
+# one more reduction per G-block in pass 1, and in slice_bwd_n that second
+# reduction next to a dot whose A operand comes from the MMA layout made
+# Triton 3.0 emit a kernel that faults (illegal memory access, job 3304325);
+# deslice_bwd_n, whose pass 1 has no such dot, was unaffected.
+_OWN_L = (os.environ.get("FLASHSLICE_OWN_L", "0").lower() in ("1", "true", "on"))
 
 
 def set_own_row_sum(flag):
@@ -266,18 +270,17 @@ def _stats_kernel(
     exp(m_old - m_new) whenever the row max moves. Stored as STATS[b, h, 0, n]
     and STATS[b, h, 1, n].
 
-    Each rescale rounds l once more than a sum against the final max would,
-    and that is why the kernels that own points (deslice_fwd_n, *_bwd_n)
-    read only m from here and form the row sum they normalize with
-    themselves, from the very exponentials they use: the temperature
-    gradient is sum dl * logit with sum_g dl = -delta * (row sum of w - 1),
-    so a row of w that does not sum to one to the precision of one
-    summation becomes a bias scaled by the logits (3x eager's error at N=17,
-    G=256 when an online l was used there). The kernels that own slots
-    (slice_fwd_g, *_bwd_g) normalize with this l: for them a row factor of
-    1 + O(ulp) is a relative perturbation of that row's contribution, not a
-    cancellation. ``_stats_twopass_kernel`` is the max-then-sum form this
-    replaces, kept behind ``set_stats_mode("two-pass")``."""
+    Each rescale rounds l once more than a sum against the final max would.
+    The backward kernels that own points (*_bwd_n) can therefore form the
+    row sum they normalize with themselves, from the very exponentials they
+    use (the OWN_L switch): the temperature gradient is sum dl * logit with
+    sum_g dl = -delta * (row sum of w - 1), so a row of w that does not sum
+    to one to the precision of one summation becomes a bias scaled by the
+    logits. Outputs and the slot-owning kernels normalize with this l: for
+    them a row factor of 1 + O(ulp) is a relative perturbation of that row's
+    contribution, not a cancellation. ``_stats_twopass_kernel`` is the
+    max-then-sum form this replaces, kept behind
+    ``set_stats_mode("two-pass")``."""
     pid = tl.program_id(0)
     bh = tl.program_id(1)
     b = bh // H
