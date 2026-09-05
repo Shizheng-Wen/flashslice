@@ -59,7 +59,7 @@ def _child(a):
     out = torch.empty_like(fx)
     dxm = torch.empty_like(xm)
     dfx = torch.empty_like(fx)
-    sx, so = fs._strides(xm), fs._strides(out)
+    sx, sf, so = fs._strides(xm), fs._strides(fx), fs._strides(out)
     stats = fb.compute_stats(xm, W, bias, tau)
     torch.cuda.synchronize()
     stats2 = torch.empty_like(stats)
@@ -86,17 +86,17 @@ def _child(a):
         "stats": lambda: stats_kernel[gn](
             xm, W, bias, tau, stats2, N, G, H, *wb, *sx, **kw),
         "slice_fwd_g": lambda: fb._slice_fwd_g_kernel[gg](
-            xm, fx, W, bias, tau, stats, pz, ps, N, G, P, H, *wb, *sx, *sx, **kw),
+            xm, fx, W, bias, tau, stats, pz, ps, N, G, P, H, *wb, *sx, *sf, **kw),
         "deslice_fwd_n": lambda: fb._deslice_fwd_n_kernel[gn](
             xm, W, bias, tau, tok, stats, out, N, G, H, *wb, *sx, *so, **kw),
         "deslice_fwd_online": lambda: fb._deslice_fwd_online_kernel[gn](
             xm, W, bias, tau, tok, stats2, out, N, G, H, *wb, *sx, *so, **kw),
         "slice_bwd_n": lambda: fb._slice_bwd_n_kernel[gn](
             xm, fx, W, bias, tau, stats, dzn, ds, dxm, dfx, delta, pdt,
-            N, G, H, *wb, *sx, *sx, **own, **kw),
+            N, G, H, *wb, *sx, *sf, **own, **kw),
         "slice_bwd_g": lambda: fb._slice_bwd_g_kernel[gg](
             xm, fx, W, bias, tau, stats, delta, dzn, ds, pdw, pdb,
-            N, G, P, H, *wb, *sx, *sx, **kw),
+            N, G, P, H, *wb, *sx, *sf, **kw),
         "deslice_bwd_n": lambda: fb._deslice_bwd_n_kernel[gn](
             xm, W, bias, tau, tok, stats, dout, dxm, delta, pdt,
             N, G, H, *wb, *sx, *so, **own, **kw),

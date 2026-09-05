@@ -174,7 +174,7 @@ def main():
             out = torch.empty_like(fx)
             dxm = torch.empty_like(xm)
             dfx = torch.empty_like(fx)
-            sx, so = fs._strides(xm), fs._strides(out)
+            sx, sf, so = fs._strides(xm), fs._strides(fx), fs._strides(out)
             key0 = "{}::{}".format(N, dt_s)
             results[key0] = {}
 
@@ -204,7 +204,7 @@ def main():
                         xm, W, bias, tau, stats2, N, G, H, *wb, *sx, **kw),
                     "slice_fwd_g": lambda: fb._slice_fwd_g_kernel[gg](
                         xm, fx, W, bias, tau, stats, pz, ps, N, G, P, H,
-                        *wb, *sx, *sx, **kw),
+                        *wb, *sx, *sf, **kw),
                     "deslice_fwd_n": lambda: fb._deslice_fwd_n_kernel[gn](
                         xm, W, bias, tau, tok, stats, out, N, G, H,
                         *wb, *sx, *so, **kw),
@@ -213,10 +213,10 @@ def main():
                         *wb, *sx, *so, **kw),
                     "slice_bwd_n": lambda: fb._slice_bwd_n_kernel[gn](
                         xm, fx, W, bias, tau, stats, dzn, ds, dxm, dfx, delta,
-                        pdt, N, G, H, *wb, *sx, *sx, **kwn),
+                        pdt, N, G, H, *wb, *sx, *sf, **kwn),
                     "slice_bwd_g": lambda: fb._slice_bwd_g_kernel[gg](
                         xm, fx, W, bias, tau, stats, delta, dzn, ds,
-                        pdw, pdb, N, G, P, H, *wb, *sx, *sx, **kw),
+                        pdw, pdb, N, G, P, H, *wb, *sx, *sf, **kw),
                     "deslice_bwd_n": lambda: fb._deslice_bwd_n_kernel[gn](
                         xm, W, bias, tau, tok, stats, dout, dxm, delta, pdt,
                         N, G, H, *wb, *sx, *so, **kwn),
@@ -237,14 +237,14 @@ def main():
                           num_warps=warps, num_stages=stages)
                 return {
                     "slice_fwd": lambda: fs._slice_fwd_kernel[(P, B * H)](
-                        xm, fx, W, bias, tau, pz, ps, N, P, H, *wb, *sx, *sx,
+                        xm, fx, W, bias, tau, pz, ps, N, P, H, *wb, *sx, *sf,
                         **kw),
                     "deslice_fwd": lambda: fs._deslice_fwd_kernel[
                         (triton.cdiv(N, bn), B * H)](
                         xm, W, bias, tau, tok, out, N, H, *wb, *sx, *so, **kw),
                     "slice_bwd": lambda: fs._slice_bwd_kernel[(P, B * H)](
                         xm, fx, W, bias, tau, dzn, ds, dxm, dfx,
-                        pdw, pdb, pdt, N, P, H, *wb, *sx, *sx, **kw),
+                        pdw, pdb, pdt, N, P, H, *wb, *sx, *sf, **kw),
                     "deslice_bwd": lambda: fs._deslice_bwd_kernel[(P, B * H)](
                         xm, W, bias, tau, tok, dout, dxm,
                         pdtok, pdw, pdb, pdt, N, P, H, *wb, *sx, *so, **kw),
