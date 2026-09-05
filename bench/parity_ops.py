@@ -34,7 +34,9 @@ import torch
 
 from flashslice.kernels import (fused_deslice, fused_slice, set_dot_mode,
                                 set_kernel_mode, set_stats_mode, stats_mode)
-from flashslice.kernels.blocked import compute_stats
+from flashslice.kernels.blocked import compute_stats, set_numerics, set_own_row_sum
+
+CASE_FILTER = []
 
 FAILED = []
 
@@ -154,6 +156,8 @@ class Case:
 
 
 def run_case(name, case, kernel_mode="auto", dot="", gate=1.25, order="slice-first"):
+    if CASE_FILTER and not any(f in name for f in CASE_FILTER):
+        return
     print("case: {} (B={} N={} H={} D={} DV={} G={} mode={} bias={} kernels={} "
           "dot={!r} order={})".format(
               name, case.B, case.N, case.H, case.D, case.DV, case.G, case.mode,
@@ -375,13 +379,25 @@ def main():
     ap.add_argument("--orders", action="store_true", help="run the call-order probe")
     ap.add_argument("--time", action="store_true", help="time the TANGO coupling shape")
     ap.add_argument("--n", type=int, default=4097)
+    ap.add_argument("--numerics", type=int, default=None,
+                    help="arithmetic level of the point-owning backward kernels (0..4)")
+    ap.add_argument("--own-row-sum", action="store_true",
+                    help="the backward kernels form their own row sum")
+    ap.add_argument("--cases", default="",
+                    help="comma-separated substrings; run only the cases whose name matches")
     a = ap.parse_args()
     import triton
     if a.stats_mode:
         set_stats_mode(a.stats_mode)
-    print("torch {}  triton {}  {}  stats mode {}".format(
+    if a.numerics is not None:
+        set_numerics(a.numerics)
+    if a.own_row_sum:
+        set_own_row_sum(True)
+    CASE_FILTER.extend(f for f in a.cases.split(",") if f)
+    from flashslice.kernels import blocked as _fb
+    print("torch {}  triton {}  {}  stats mode {}  numerics {}  own_row_sum {}".format(
         torch.__version__, triton.__version__, torch.cuda.get_device_name(0),
-        stats_mode()), flush=True)
+        stats_mode(), _fb._NUMERICS, _fb._OWN_L), flush=True)
     torch.backends.cuda.matmul.allow_tf32 = False
     n = a.n
     # the upstream path, unchanged: leaf (G, D) weights on both families
@@ -421,9 +437,10 @@ def main():
              dot="bf16")
     run_case("bhgd-bf16-blk-g1024-d56-dv32-deslice-first",
              Case(1, n, 8, 56, 1024, DV=32, bias=False), dot="bf16", order="deslice-first")
-    print("statistics agreement (online deslice / online stats / two-pass stats)", flush=True)
-    stats_agreement(Case(1, n, 8, 56, 1024, DV=32, bias=False))
-    stats_agreement(Case(2, 17, 4, 56, 256, DV=32, bias=False))
+    if not CASE_FILTER:
+        print("statistics agreement (online deslice / online stats / two-pass stats)", flush=True)
+        stats_agreement(Case(1, n, 8, 56, 1024, DV=32, bias=False))
+        stats_agreement(Case(2, 17, 4, 56, 256, DV=32, bias=False))
     if a.orders:
         print("call orders", flush=True)
         call_orders()

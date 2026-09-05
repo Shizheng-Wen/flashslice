@@ -79,7 +79,7 @@ def _child(a):
     kw = fb._consts(D, G, DT, GB, bn, dot, warps, stages, DV)
     gn = (triton.cdiv(N, bn), B * H)
     gg = (NGB, P, B * H)
-    own = dict(OWN_L=fb._OWN_L)
+    own = dict(OWN_L=fb._OWN_L, NUMERICS=fb._NUMERICS)
     stats_kernel = (fb._stats_kernel if fb.stats_mode() == "online"
                     else fb._stats_twopass_kernel)
     launches = {
@@ -108,8 +108,21 @@ def _child(a):
     torch.cuda.synchronize()
     launches[a.kernel]()
     torch.cuda.synchronize()
-    print("OK {} bn{} w{} s{} (D_tile={} G_block={} DV_tile={})".format(
-        a.kernel, bn, warps, stages, DT, GB, DVT), flush=True)
+    timing = ""
+    if a.time:
+        import statistics
+        ts = []
+        for _ in range(a.time):
+            t0 = torch.cuda.Event(enable_timing=True)
+            t1 = torch.cuda.Event(enable_timing=True)
+            t0.record()
+            launches[a.kernel]()
+            t1.record()
+            torch.cuda.synchronize()
+            ts.append(t0.elapsed_time(t1))
+        timing = " {:8.3f} ms".format(statistics.median(ts))
+    print("OK {} bn{} w{} s{} N={} (D_tile={} G_block={} DV_tile={}){}".format(
+        a.kernel, bn, warps, stages, N, DT, GB, DVT, timing), flush=True)
 
 
 def main():
@@ -117,7 +130,9 @@ def main():
     p.add_argument("--slices", type=int, default=256)
     p.add_argument("--dim-head", type=int, default=32)
     p.add_argument("--dim-value", type=int, default=None)
-    p.add_argument("--n", type=int, default=30013)
+    p.add_argument("--n", default="30013", help="points; comma-separated values sweep N")
+    p.add_argument("--time", type=int, default=0,
+                   help="also time the launch: median of this many iterations")
     p.add_argument("--dtype", choices=("fp32", "bf16"), default="bf16")
     p.add_argument("--dot", choices=tuple(DOT), default="bf16")
     p.add_argument("--block-g", type=int, default=None)
@@ -131,6 +146,7 @@ def main():
     p.add_argument("--_child", action="store_true", help=argparse.SUPPRESS)
     a = p.parse_args()
     if a._child:
+        a.n = int(a.n)
         a.bn = int(a.bn) if a.bn else None
         a.warps = int(a.warps) if a.warps else None
         a.stages = int(a.stages) if a.stages else None
@@ -139,15 +155,16 @@ def main():
     kernels = (a.kernel,) if a.kernel else KERNELS
     grid = itertools.product(
         kernels,
+        str(a.n).split(","),
         (a.bn or "").split(",") if a.bn else [None],
         (a.warps or "").split(",") if a.warps else [None],
         (a.stages or "").split(",") if a.stages else [None])
     env = dict(os.environ, CUDA_LAUNCH_BLOCKING="1")
     failed = 0
-    for kname, bn, warps, stages in grid:
+    for kname, n, bn, warps, stages in grid:
         cmd = [sys.executable, os.path.abspath(__file__), "--_child", "--kernel", kname,
-               "--slices", str(a.slices), "--dim-head", str(a.dim_head), "--n", str(a.n),
-               "--dtype", a.dtype, "--dot", a.dot]
+               "--slices", str(a.slices), "--dim-head", str(a.dim_head), "--n", n,
+               "--dtype", a.dtype, "--dot", a.dot, "--time", str(a.time)]
         if a.dim_value:
             cmd += ["--dim-value", str(a.dim_value)]
         if a.block_g:
@@ -168,9 +185,11 @@ def main():
             print("  " + tail, flush=True)
         else:
             failed += 1
-            err = (r.stderr.strip().splitlines() or ["<no stderr>"])[-1][:200]
-            print("  FAIL {} bn={} w={} s={} rc={}: {}".format(
-                kname, bn, warps, stages, r.returncode, err), flush=True)
+            lines = r.stderr.strip().splitlines() or ["<no stderr>"]
+            print("  FAIL {} N={} bn={} w={} s={} rc={}: {}".format(
+                kname, n, bn, warps, stages, r.returncode, lines[-1][:200]), flush=True)
+            for line in lines[-8:-1]:
+                print("       | " + line[:160], flush=True)
     print("{} failure(s)".format(failed) if failed else "all launches OK")
     sys.exit(1 if failed else 0)
 

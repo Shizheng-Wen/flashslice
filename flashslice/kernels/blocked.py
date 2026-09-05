@@ -133,6 +133,18 @@ def set_own_row_sum(flag):
     _OWN_L = bool(flag)
 
 
+# The arithmetic of the point-owning backward kernels, for attribution only
+# (see _slice_bwd_n_kernel): 4 is the production form.
+_NUMERICS = int(os.environ.get("FLASHSLICE_NUMERICS", "4"))
+
+
+def set_numerics(level):
+    global _NUMERICS
+    if level not in (0, 1, 2, 3, 4):
+        raise ValueError("numerics level must be 0..4, got %r" % (level,))
+    _NUMERICS = int(level)
+
+
 def tiles(d, g):
     """(D_tile, G_block) for the blocked kernels at head width d, slice count g."""
     dt = _pow2_at_least_16(d)
@@ -241,6 +253,12 @@ def _load_stats(STATS, bh64, N, offs_n64):
     m = _load_vec(base, offs_n64, N)
     l = _load_vec(base + N, offs_n64, N)
     return m, l
+
+
+@triton.jit
+def _logits_div(xm, w_mat, bias, tau, DOT: tl.constexpr):
+    """The logits with a per-element division by tau (NUMERICS level 0)."""
+    return (_dot_w(xm, tl.trans(w_mat), DOT) + bias[None, :]) / tau
 
 
 @triton.jit
@@ -552,31 +570,32 @@ def _slice_bwd_n_kernel(
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
     DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
-    OWN_L: tl.constexpr,
+    OWN_L: tl.constexpr, NUMERICS: tl.constexpr,
 ):
-    """Owns one N-block. Pass 1 over G, unnormalized: dfx = e @ dz_num and
-    the Jacobian numerator sum_g (e dw), with the row sum l = sum_g e formed
-    alongside when OWN_L (else the saved l is taken); everything is scaled by
-    1/l once. Pass 2: dxm, and the temperature gradient.
+    """Owns one N-block. Pass 1 over G: dfx = w @ dz_num and the Jacobian
+    term delta = sum_g w dw. Pass 2: dxm, and the temperature gradient.
 
-    delta = (sum_g e_g dw_g) / l and dl_g = (e_g dw_g - e_g delta) / l are
-    built from the same rounded products e_g dw_g, so that sum_g dl vanishes
-    to the precision of one summation, as it does in the single-tile
-    kernels. Normalizing w_g = e_g / l first and forming delta from w_g dw_g
-    while dl uses w_g (dw_g - delta) puts a second, independently rounded
-    product into the identity, and the temperature gradient -- sum dl *
-    logit, a cancellation -- showed it as 1.5-1.9x eager's error (N=17 and
-    N=4097, G=256 and 2048); the algebraically equal delta = fx . dfx +
-    w @ ds (one dot cheaper) had shown 3x. Every other gradient is
-    indifferent to either.
+    delta and dl = w (dw - delta) are built from the same rounded products,
+    so that sum_g dl vanishes to the precision of one summation, as it does
+    in the single-tile kernels: the temperature gradient, sum dl * logit, is
+    a cancellation and shows any coherent deviation at once (an
+    algebraically equal delta = fx . dfx + w @ ds put 3x eager's error on it
+    at N=17, G=256; an independently rounded second product 1.5-1.9x).
 
     dtau lives here and not in the G-owned kernel because it is
     sum_n sum_g dl * (-logit / tau) with sum_g dl = 0 on every row: the row
     sums cancel almost completely, and they must be formed row by row, over
-    all of G, before anything is added across rows — the order the
+    all of G, before anything is added across rows -- the order the
     single-tile kernels use. Summing each G-block's share over N first and
     cancelling across blocks at the end put 2-3x eager's error on this
-    gradient (N=17, G=256 and G=512), while every other gradient matched."""
+    gradient (N=17, G=256 and G=512), while every other gradient matched.
+
+    NUMERICS selects the arithmetic, oldest to newest, for attribution:
+    0 divisions by tau and by l per element, w normalized in both passes;
+    1 tau as a reciprocal; 2 l as a per-row reciprocal too; 3 pass 1
+    unnormalized (e in place of w, scaled once at the end); 4 pass 2 from
+    the same e*dw products as pass 1. OWN_L (levels >= 3): pass 1 forms the
+    row sum itself instead of taking the saved l."""
     pid = tl.program_id(0)
     bh = tl.program_id(1)
     b = bh // H
@@ -596,7 +615,9 @@ def _slice_bwd_n_kernel(
     fx = _load_rows(FX, b, h, offs_n64, offs_v, nmask, vmask, sfb, sfn, sfh, sfd,
                     PAD_V)
     m, l_saved = _load_stats(STATS, bh64, N, offs_n64)
-    inv_tau = 1.0 / tl.load(TAU + h).to(tl.float32)
+    tau = tl.load(TAU + h).to(tl.float32)
+    inv_tau = 1.0 / tau
+    inv_l = 1.0 / l_saved
 
     acc_dfx = tl.zeros((BN, DVT), dtype=tl.float32)
     sdw = tl.zeros((BN,), dtype=tl.float32)
@@ -605,23 +626,38 @@ def _slice_bwd_n_kernel(
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        e = _expw(_logits(xm, w_mat, bias, inv_tau, DOT), m)
+        if NUMERICS >= 1:
+            lg = _logits(xm, w_mat, bias, inv_tau, DOT)
+        else:
+            lg = _logits_div(xm, w_mat, bias, tau, DOT)
+        e = _expw(lg, m)
         if PAD_G:
             e = tl.where(gmask[None, :], e, 0.0)
         dzn = _load_tok(DZN, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
         ds = _load_vec(DS + bh64 * G, offs_g, G)
-        acc_dfx += _dot(e, dzn, DOT)
         dw = _dot(fx, tl.trans(dzn), DOT) + ds[None, :]
-        sdw += tl.sum(e * dw, axis=1)
+        if NUMERICS >= 3:
+            acc_dfx += _dot(e, dzn, DOT)
+            sdw += tl.sum(e * dw, axis=1)
+            if OWN_L:
+                l += tl.sum(e, axis=1)
+        else:
+            if NUMERICS >= 2:
+                w = e * inv_l[:, None]
+            else:
+                w = e / l_saved[:, None]
+            acc_dfx += _dot(w, dzn, DOT)
+            sdw += tl.sum(w * dw, axis=1)
+    if NUMERICS >= 3:
         if OWN_L:
-            l += tl.sum(e, axis=1)
-    if OWN_L:
-        inv_l = 1.0 / l
+            inv_l = 1.0 / l
+        delta = sdw * inv_l
+        _store_rows(DFX, acc_dfx * inv_l[:, None], b, h, offs_n64, offs_v, nmask,
+                    vmask, sfb, sfn, sfh, sfd, PAD_V)
     else:
-        inv_l = 1.0 / l_saved
-    delta = sdw * inv_l
-    _store_rows(DFX, acc_dfx * inv_l[:, None], b, h, offs_n64, offs_v, nmask, vmask,
-                sfb, sfn, sfh, sfd, PAD_V)
+        delta = sdw
+        _store_rows(DFX, acc_dfx, b, h, offs_n64, offs_v, nmask, vmask,
+                    sfb, sfn, sfh, sfd, PAD_V)
     tl.store(DELTA + bh64 * N + offs_n64, delta, mask=nmask)
 
     acc_dxm = tl.zeros((BN, DT), dtype=tl.float32)
@@ -630,20 +666,38 @@ def _slice_bwd_n_kernel(
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        lg = _logits(xm, w_mat, bias, inv_tau, DOT)
+        if NUMERICS >= 1:
+            lg = _logits(xm, w_mat, bias, inv_tau, DOT)
+        else:
+            lg = _logits_div(xm, w_mat, bias, tau, DOT)
         e = _expw(lg, m)
         if PAD_G:
             e = tl.where(gmask[None, :], e, 0.0)
         dzn = _load_tok(DZN, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
         ds = _load_vec(DS + bh64 * G, offs_g, G)
         dw = _dot(fx, tl.trans(dzn), DOT) + ds[None, :]
-        dl = (e * dw - e * delta[:, None]) * inv_l[:, None]
-        acc_dxm += _dot(dl * inv_tau, w_mat, DOT)
-        row_dt += tl.sum(dl * lg, axis=1)
+        if NUMERICS >= 4:
+            dl = (e * dw - e * delta[:, None]) * inv_l[:, None]
+        else:
+            if NUMERICS >= 2:
+                w = e * inv_l[:, None]
+            else:
+                w = e / l_saved[:, None]
+            dl = w * (dw - delta[:, None])
+        if NUMERICS >= 1:
+            acc_dxm += _dot(dl * inv_tau, w_mat, DOT)
+            row_dt += tl.sum(dl * lg, axis=1)
+        else:
+            acc_dxm += _dot(dl / tau, w_mat, DOT)
+            row_dt += tl.sum(dl * (-lg / tau), axis=1)
     _store_rows(DXM, acc_dxm, b, h, offs_n64, offs_d, nmask, dmask,
                 sxb, sxn, sxh, sxd, PAD_D)
-    tl.store(PDT + bh64 * tl.num_programs(0) + pid,
-             -inv_tau * tl.sum(tl.where(nmask, row_dt, 0.0), axis=0))
+    if NUMERICS >= 1:
+        tl.store(PDT + bh64 * tl.num_programs(0) + pid,
+                 -inv_tau * tl.sum(tl.where(nmask, row_dt, 0.0), axis=0))
+    else:
+        tl.store(PDT + bh64 * tl.num_programs(0) + pid,
+                 tl.sum(tl.where(nmask, row_dt, 0.0), axis=0))
 
 
 @triton.jit
@@ -719,13 +773,13 @@ def _deslice_bwd_n_kernel(
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
     DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
-    OWN_L: tl.constexpr,
+    OWN_L: tl.constexpr, NUMERICS: tl.constexpr,
 ):
-    """Owns one N-block. Pass 1 over G, unnormalized: the Jacobian numerator
-    sum_g e (dout . z'[g]) and, when OWN_L, the row sum l = sum_g e (delta is
-    recomputed rather than read back from a rounded `out`). Pass 2: dxm and
-    the temperature gradient from the same products (row by row over all of
-    G, for the reasons given on _slice_bwd_n_kernel)."""
+    """Owns one N-block. Pass 1 over G: delta = sum_g w (dout . z'[g])
+    (recomputed rather than read back from a rounded `out`). Pass 2: dxm and
+    the temperature gradient (row by row over all of G, from the same
+    products, for the reasons given on _slice_bwd_n_kernel; NUMERICS and
+    OWN_L as there)."""
     pid = tl.program_id(0)
     bh = tl.program_id(1)
     b = bh // H
@@ -745,7 +799,9 @@ def _deslice_bwd_n_kernel(
     dout = _load_rows(DOUT, b, h, offs_n64, offs_v, nmask, vmask, sob, son, soh,
                       sod, PAD_V)
     m, l_saved = _load_stats(STATS, bh64, N, offs_n64)
-    inv_tau = 1.0 / tl.load(TAU + h).to(tl.float32)
+    tau = tl.load(TAU + h).to(tl.float32)
+    inv_tau = 1.0 / tau
+    inv_l = 1.0 / l_saved
 
     sdw = tl.zeros((BN,), dtype=tl.float32)
     l = tl.zeros((BN,), dtype=tl.float32)
@@ -753,18 +809,31 @@ def _deslice_bwd_n_kernel(
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        e = _expw(_logits(xm, w_mat, bias, inv_tau, DOT), m)
+        if NUMERICS >= 1:
+            lg = _logits(xm, w_mat, bias, inv_tau, DOT)
+        else:
+            lg = _logits_div(xm, w_mat, bias, tau, DOT)
+        e = _expw(lg, m)
         if PAD_G:
             e = tl.where(gmask[None, :], e, 0.0)
         tok = _load_tok(TOK, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
-        sdw += tl.sum(e * _dot(dout, tl.trans(tok), DOT), axis=1)
+        dw = _dot(dout, tl.trans(tok), DOT)
+        if NUMERICS >= 3:
+            sdw += tl.sum(e * dw, axis=1)
+            if OWN_L:
+                l += tl.sum(e, axis=1)
+        else:
+            if NUMERICS >= 2:
+                w = e * inv_l[:, None]
+            else:
+                w = e / l_saved[:, None]
+            sdw += tl.sum(w * dw, axis=1)
+    if NUMERICS >= 3:
         if OWN_L:
-            l += tl.sum(e, axis=1)
-    if OWN_L:
-        inv_l = 1.0 / l
+            inv_l = 1.0 / l
+        delta = sdw * inv_l
     else:
-        inv_l = 1.0 / l_saved
-    delta = sdw * inv_l
+        delta = sdw
     tl.store(DELTA + bh64 * N + offs_n64, delta, mask=nmask)
 
     acc_dxm = tl.zeros((BN, DT), dtype=tl.float32)
@@ -773,19 +842,37 @@ def _deslice_bwd_n_kernel(
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        lg = _logits(xm, w_mat, bias, inv_tau, DOT)
+        if NUMERICS >= 1:
+            lg = _logits(xm, w_mat, bias, inv_tau, DOT)
+        else:
+            lg = _logits_div(xm, w_mat, bias, tau, DOT)
         e = _expw(lg, m)
         if PAD_G:
             e = tl.where(gmask[None, :], e, 0.0)
         tok = _load_tok(TOK, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
         dw = _dot(dout, tl.trans(tok), DOT)
-        dl = (e * dw - e * delta[:, None]) * inv_l[:, None]
-        acc_dxm += _dot(dl * inv_tau, w_mat, DOT)
-        row_dt += tl.sum(dl * lg, axis=1)
+        if NUMERICS >= 4:
+            dl = (e * dw - e * delta[:, None]) * inv_l[:, None]
+        else:
+            if NUMERICS >= 2:
+                w = e * inv_l[:, None]
+            else:
+                w = e / l_saved[:, None]
+            dl = w * (dw - delta[:, None])
+        if NUMERICS >= 1:
+            acc_dxm += _dot(dl * inv_tau, w_mat, DOT)
+            row_dt += tl.sum(dl * lg, axis=1)
+        else:
+            acc_dxm += _dot(dl / tau, w_mat, DOT)
+            row_dt += tl.sum(dl * (-lg / tau), axis=1)
     _store_rows(DXM, acc_dxm, b, h, offs_n64, offs_d, nmask, dmask,
                 sxb, sxn, sxh, sxd, PAD_D)
-    tl.store(PDT + bh64 * tl.num_programs(0) + pid,
-             -inv_tau * tl.sum(tl.where(nmask, row_dt, 0.0), axis=0))
+    if NUMERICS >= 1:
+        tl.store(PDT + bh64 * tl.num_programs(0) + pid,
+                 -inv_tau * tl.sum(tl.where(nmask, row_dt, 0.0), axis=0))
+    else:
+        tl.store(PDT + bh64 * tl.num_programs(0) + pid,
+                 tl.sum(tl.where(nmask, row_dt, 0.0), axis=0))
 
 
 @triton.jit
@@ -1118,7 +1205,8 @@ def _slice_blk_bwd_impl(x_mid, fx_mid, weight, bias, tau, stats, dz_num, ds,
     _slice_bwd_n_kernel[(nprog, B * H)](
         x_mid, fx_mid, weight, bias, tau, stats, dz_num, ds, dxm, dfx, delta,
         pdt, N, G, H, *wb, *_strides(x_mid), *_strides(fx_mid),
-        OWN_L=_OWN_L, **_consts(D, G, dt, gb, bn, dot, warps, stages, DV))
+        OWN_L=_OWN_L, NUMERICS=_NUMERICS,
+        **_consts(D, G, dt, gb, bn, dot, warps, stages, DV))
     bn, warps, stages = _launch_cfg("slice_bwd_g", x_mid, dot, gb, dt, dvt)
     P = _n_programs(N, B * H * ngb, bn)
     pdw = torch.empty(B * H * P, G, D, device=x_mid.device, dtype=torch.float32)
@@ -1181,7 +1269,8 @@ def _deslice_blk_bwd_impl(x_mid, weight, bias, tau, tokens, stats, d_out, dot):
     _deslice_bwd_n_kernel[(nprog, B * H)](
         x_mid, weight, bias, tau, tokens, stats, d_out, dxm, delta, pdt,
         N, G, H, *wb, *_strides(x_mid), *_strides(d_out),
-        OWN_L=_OWN_L, **_consts(D, G, dt, gb, bn, dot, warps, stages, DV))
+        OWN_L=_OWN_L, NUMERICS=_NUMERICS,
+        **_consts(D, G, dt, gb, bn, dot, warps, stages, DV))
     bn, warps, stages = _launch_cfg("deslice_bwd_g", x_mid, dot, gb, dt, dvt)
     P = _n_programs(N, B * H * ngb, bn)
     pdtok = torch.empty(B * H * P, G, DV, device=x_mid.device,
@@ -1297,4 +1386,4 @@ torch.library.register_autograd("flashslice::deslice_blk", _deslice_grad,
                                 setup_context=_deslice_setup)
 
 __all__ = ["tiles", "set_block_g", "compute_stats", "set_stats_mode", "stats_mode",
-           "set_own_row_sum"]
+           "set_own_row_sum", "set_numerics"]
