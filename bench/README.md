@@ -21,7 +21,7 @@ and per-sample weights, a value width apart from the logits width, both tied
 call orders (slice first with its statistics handed to the deslice, deslice
 first with the online kernel's statistics handed to the slice), tiny `N`,
 `G = 1` and the bf16 modes; `--stats-mode two-pass` runs the same cases on
-the original statistics kernel.
+the original statistics kernel, `--cases` filters them by name.
 
 ## Timing and memory
 
@@ -78,8 +78,7 @@ Notes that cost us time and may cost you some:
   or at the next allocation. `launch_probe.py` launches every blocked kernel
   at a shape in its own process, with `CUDA_LAUNCH_BLOCKING=1` and a
   timeout, and names the one that faults or hangs.
-- **Triton 3.0 miscompiles a loop body with two row reductions next to a dot
-  whose A operand comes from the MMA layout** (the kernel faults, or under
-  tf32x3 returns garbage). The blocked kernels keep one reduction per pass in
-  that position; `set_own_row_sum(True)` restores the second and is there for
-  attribution only.
+- **Every tensor needs its own strides in a hand-written launch.** The
+  benches once passed `x_mid`'s strides for `fx_mid`; with `DV != D` every
+  slice kernel then read out of bounds and the "illegal memory access" looked
+  like a kernel bug for a day. Check the harness before suspecting Triton.

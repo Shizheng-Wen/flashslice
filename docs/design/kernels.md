@@ -44,11 +44,7 @@ two kernels that own points and have no statistics yet (below).
 \(m_n\) and the sum of exponentials \(l_n\) of the slot logits — two floats,
 \(2/G\) of the tensor the eager path stores — in one online pass over the
 slots. Every other kernel recomputes \(w_{ng} = \exp(\text{logit}_{ng} - m_n) /
-l_n\) one block at a time. The statistics are kept for the backward. The
-backward kernels that own points form the row sum they normalize with
-themselves, from the exponentials they use, for the reason given in
-[Numerics](numerics.md#the-canary-the-temperature-gradient); the forward
-and the slot-owning kernels take the saved \(l\).
+l_n\) one block at a time. The statistics are kept for the backward.
 
 **The online deslice.** A deslice with no statistics in hand does not run the
 statistics pass first: it runs FlashAttention's forward, rescaling its
@@ -91,10 +87,11 @@ a tensor-core mode to pull ahead of eager ([Performance](../performance.md)).
 
 For one \((n, g)\) pair and head, a forward pass does one logits multiply-add
 chain of length \(D\), one exponential, one value multiply-add chain of length
-\(D_V\), and a handful of fp32 operations: the temperature (a multiply by a
-reciprocal formed once per program), the shift by \(m_n\), the mask where the
-last block is padded. Divisions are gone from the inner loops: the row
-normalizer is applied once per row after the loop in the point-owning
-kernels, and as a per-row reciprocal per tile in the slot-owning ones. At
+\(D_V\), and a handful of fp32 operations: the temperature, the shift by
+\(m_n\), the mask where the last block is padded. On the tensor-core dot
+paths the divisions by \(\tau\) and by the row sum are multiplies by
+reciprocals formed once per program or per row; on the FMA paths they stay
+divisions, because the multiply changed the layout Triton 3.0 gave the tile
+and cost the FMA dot its vectorized operand (3–60× slower). At
 \(D + D_V \approx 90\) the exponential is the second cost after the dots, the
 same limit FlashAttention-3 meets at small head dimensions.

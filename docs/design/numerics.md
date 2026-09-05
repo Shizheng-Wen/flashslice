@@ -12,6 +12,15 @@ fused runs must agree bitwise. `bench/parity_test.py` applies this to the
 layer at the paper's shapes, `bench/parity_ops.py` to the ops on every shape,
 weight layout and call order the layer does not exercise.
 
+One exception is calibrated rather than assumed: on the blocked family the
+temperature gradient is gated at 2× in `parity_ops`. Against a true-fp32
+eager (`allow_tf32` off, which the op-level script enforces) every arithmetic
+variant of the point-owning backward kernels, the original per-element
+division form included, lands within 2× of eager on it, and none within 1.25×
+on every shape (1.9–2.1× at `G=2048, N=4097` for the original form, 1.5–1.65×
+at `N=17, G=256` for the production form). The layer-level gate at the
+paper's shapes stays at 1.25× and passes.
+
 ## The canary: the temperature gradient
 
 \[
@@ -30,14 +39,13 @@ it was the only one that did. Three rules came out of it:
 1. **Save \((m, l)\), not \(\text{lse} = m + \log l\).** Recomputing
    \(\exp(\text{logit} - \text{lse})\) rounds the argument of the dominant
    weights.
-2. **The backward kernels that own points normalize with a row sum they form
-   themselves**, from the very exponentials they use, so a row of \(w\) sums
-   to one to the precision of one summation whatever rounding the saved
-   \(l\) carries (`set_own_row_sum` switches this off for attribution). The
-   saved \(l\) comes from an online pass, rescaled once per move of the row
-   max. Outputs and the slot-owning kernels take the saved \(l\): for them a
-   row factor of \(1 + O(\text{ulp})\) is a relative perturbation of that
-   row's contribution, not a cancellation.
+2. **The saved \(l\) serves every kernel.** It comes from an online pass,
+   rescaled once per move of the row max, and measured that costs nothing
+   the gate can see: letting the backward kernels form the row sum
+   themselves from the exponentials they use made \(d\tau\) slightly worse,
+   not better (and, next to a dot fed from the MMA layout, made Triton 3.0
+   emit a kernel that faults at \(D = 32\)). The original two-pass form is
+   kept behind `set_stats_mode("two-pass")` for attribution.
 3. **\(\delta_n\) and \(dl_{ng}\) are built from the same rounded products
    \(e_{ng}\, dw_{ng}\)**: \(\delta_n = (\sum_g e_{ng} dw_{ng}) / l_n\) in the
    first pass and \(dl_{ng} = (e_{ng} dw_{ng} - e_{ng} \delta_n) / l_n\) in the

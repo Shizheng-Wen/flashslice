@@ -194,7 +194,6 @@ def main():
                 pdt = torch.empty(B * H * triton.cdiv(N, bn), device="cuda")
                 pdtok = torch.empty(B * H * P, G, DV, device="cuda")
                 kw = fb._consts(D, G, DT, GB, bn, dot, warps, stages, DV)
-                kwn = dict(kw, OWN_L=fb._OWN_L, NUMERICS=fb._NUMERICS)
                 gn = (triton.cdiv(N, bn), B * H)
                 gg = (NGB, P, B * H)
                 stats_kernel = (fb._stats_kernel if fb.stats_mode() == "online"
@@ -213,13 +212,13 @@ def main():
                         *wb, *sx, *so, **kw),
                     "slice_bwd_n": lambda: fb._slice_bwd_n_kernel[gn](
                         xm, fx, W, bias, tau, stats, dzn, ds, dxm, dfx, delta,
-                        pdt, N, G, H, *wb, *sx, *sf, **kwn),
+                        pdt, N, G, H, *wb, *sx, *sf, **kw),
                     "slice_bwd_g": lambda: fb._slice_bwd_g_kernel[gg](
                         xm, fx, W, bias, tau, stats, delta, dzn, ds,
                         pdw, pdb, N, G, P, H, *wb, *sx, *sf, **kw),
                     "deslice_bwd_n": lambda: fb._deslice_bwd_n_kernel[gn](
                         xm, W, bias, tau, tok, stats, dout, dxm, delta, pdt,
-                        N, G, H, *wb, *sx, *so, **kwn),
+                        N, G, H, *wb, *sx, *so, **kw),
                     "deslice_bwd_g": lambda: fb._deslice_bwd_g_kernel[gg](
                         xm, W, bias, tau, tok, stats, delta, dout,
                         pdtok, pdw, pdb, N, G, P, H, *wb, *sx, *so, **kw),

@@ -79,7 +79,6 @@ def _child(a):
     kw = fb._consts(D, G, DT, GB, bn, dot, warps, stages, DV)
     gn = (triton.cdiv(N, bn), B * H)
     gg = (NGB, P, B * H)
-    own = dict(OWN_L=fb._OWN_L, NUMERICS=fb._NUMERICS)
     stats_kernel = (fb._stats_kernel if fb.stats_mode() == "online"
                     else fb._stats_twopass_kernel)
     launches = {
@@ -93,13 +92,13 @@ def _child(a):
             xm, W, bias, tau, tok, stats2, out, N, G, H, *wb, *sx, *so, **kw),
         "slice_bwd_n": lambda: fb._slice_bwd_n_kernel[gn](
             xm, fx, W, bias, tau, stats, dzn, ds, dxm, dfx, delta, pdt,
-            N, G, H, *wb, *sx, *sf, **own, **kw),
+            N, G, H, *wb, *sx, *sf, **kw),
         "slice_bwd_g": lambda: fb._slice_bwd_g_kernel[gg](
             xm, fx, W, bias, tau, stats, delta, dzn, ds, pdw, pdb,
             N, G, P, H, *wb, *sx, *sf, **kw),
         "deslice_bwd_n": lambda: fb._deslice_bwd_n_kernel[gn](
             xm, W, bias, tau, tok, stats, dout, dxm, delta, pdt,
-            N, G, H, *wb, *sx, *so, **own, **kw),
+            N, G, H, *wb, *sx, *so, **kw),
         "deslice_bwd_g": lambda: fb._deslice_bwd_g_kernel[gg](
             xm, W, bias, tau, tok, stats, delta, dout, pdtok, pdw, pdb,
             N, G, P, H, *wb, *sx, *so, **kw),
