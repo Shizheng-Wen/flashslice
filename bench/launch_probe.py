@@ -125,6 +125,9 @@ def main():
     p.add_argument("--bn", default=None, help="BLOCK_N value(s), comma separated")
     p.add_argument("--warps", default=None)
     p.add_argument("--stages", default=None)
+    p.add_argument("--timeout", type=float, default=900.0,
+                   help="seconds per launch before the child is killed and "
+                        "reported as TIMEOUT (a hung compile or kernel)")
     p.add_argument("--_child", action="store_true", help=argparse.SUPPRESS)
     a = p.parse_args()
     if a._child:
@@ -152,7 +155,14 @@ def main():
         for flag, val in (("--bn", bn), ("--warps", warps), ("--stages", stages)):
             if val:
                 cmd += [flag, val]
-        r = subprocess.run(cmd, env=env, capture_output=True, text=True)
+        try:
+            r = subprocess.run(cmd, env=env, capture_output=True, text=True,
+                               timeout=a.timeout)
+        except subprocess.TimeoutExpired:
+            failed += 1
+            print("  TIMEOUT {} bn={} w={} s={} after {:.0f} s".format(
+                kname, bn, warps, stages, a.timeout), flush=True)
+            continue
         tail = (r.stdout.strip().splitlines() or [""])[-1]
         if r.returncode == 0 and tail.startswith("OK"):
             print("  " + tail, flush=True)

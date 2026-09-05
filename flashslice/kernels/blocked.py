@@ -637,7 +637,7 @@ def _slice_bwd_n_kernel(
         dzn = _load_tok(DZN, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
         ds = _load_vec(DS + bh64 * G, offs_g, G)
         dw = _dot(fx, tl.trans(dzn), DOT) + ds[None, :]
-        dl = (e * dw - e * delta[:, None]) * inv_l
+        dl = (e * dw - e * delta[:, None]) * inv_l[:, None]
         acc_dxm += _dot(dl * inv_tau, w_mat, DOT)
         row_dt += tl.sum(dl * lg, axis=1)
     _store_rows(DXM, acc_dxm, b, h, offs_n64, offs_d, nmask, dmask,
@@ -779,7 +779,7 @@ def _deslice_bwd_n_kernel(
             e = tl.where(gmask[None, :], e, 0.0)
         tok = _load_tok(TOK, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
         dw = _dot(dout, tl.trans(tok), DOT)
-        dl = (e * dw - e * delta[:, None]) * inv_l
+        dl = (e * dw - e * delta[:, None]) * inv_l[:, None]
         acc_dxm += _dot(dl * inv_tau, w_mat, DOT)
         row_dt += tl.sum(dl * lg, axis=1)
     _store_rows(DXM, acc_dxm, b, h, offs_n64, offs_d, nmask, dmask,

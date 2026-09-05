@@ -6,14 +6,22 @@ one NVIDIA GH200 (95 GB usable HBM) under torch 2.5 / Triton 3.0.
 ## Correctness first
 
 ```bash
-python parity_test.py
+python parity_test.py            # the layer, at the paper's shapes
+python parity_ops.py             # the ops, on every shape the layer does not reach
+python parity_ops.py --orders    # every call order of the two ops survives a backward
 ```
 
-Compares the fused path against eager on outputs and on every parameter
-gradient, referenced to an fp64 computation, for each dot mode (`ieee`, `tf32`,
-`bf16`). The gate is a relative-error class, not an absolute epsilon: fp32
-fused must land at or below eager's own error against fp64. It also covers each
-value of `G` separately, since the tile tables differ per `G`.
+`parity_test.py` compares the fused layer against eager on outputs and on
+every parameter gradient, referenced to an fp64 computation, for each dot
+mode (`ieee`, `tf32`, `bf16`). The gate is a relative-error class, not an
+absolute epsilon: fp32 fused must land at or below eager's own error against
+fp64. It also covers each value of `G` separately, since the tile tables
+differ per `G`. `parity_ops.py` holds the ops to the same gate on per-head
+and per-sample weights, a value width apart from the logits width, both tied
+call orders (slice first with its statistics handed to the deslice, deslice
+first with the online kernel's statistics handed to the slice), tiny `N`,
+`G = 1` and the bf16 modes; `--stats-mode two-pass` runs the same cases on
+the original statistics kernel.
 
 ## Timing and memory
 
@@ -65,3 +73,13 @@ Notes that cost us time and may cost you some:
 - `--verbose` prints each configuration before launching it. Triton 3.0 can
   abort the process rather than raise on some tile/warp combinations, and the
   printed line is what tells you which one did it.
+- **A sticky CUDA error surfaces under the next kernel's name**: an illegal
+  memory access in one kernel is reported at the following launch's compile
+  or at the next allocation. `launch_probe.py` launches every blocked kernel
+  at a shape in its own process, with `CUDA_LAUNCH_BLOCKING=1` and a
+  timeout, and names the one that faults or hangs.
+- **Triton 3.0 miscompiles a loop body with two row reductions next to a dot
+  whose A operand comes from the MMA layout** (the kernel faults, or under
+  tf32x3 returns garbage). The blocked kernels keep one reduction per pass in
+  that position; `set_own_row_sum(True)` restores the second and is there for
+  attribution only.
