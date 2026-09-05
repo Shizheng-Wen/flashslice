@@ -1,0 +1,30 @@
+name: docs
+
+# Builds the MkDocs site from docs/ and publishes it to the gh-pages branch,
+# which GitHub Pages serves. Runs on every push to main that touches the docs
+# or this workflow, and on request.
+on:
+  push:
+    branches: [main]
+    paths: ["docs/**", "mkdocs.yml", ".github/workflows/docs.yml"]
+  workflow_dispatch:
+
+permissions:
+  contents: write
+
+concurrency:
+  group: docs
+  cancel-in-progress: true
+
+jobs:
+  deploy:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          fetch-depth: 0
+      - uses: actions/setup-python@v5
+        with:
+          python-version: "3.12"
+      - run: pip install -r docs/requirements.txt
+      - run: mkdocs gh-deploy --force --no-history

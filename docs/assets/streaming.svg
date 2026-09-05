@@ -1,0 +1,40 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 400" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="14">
+  <defs>
+    <marker id="arr2" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+      <path d="M0,0 L10,5 L0,10 z" fill="#4b5563"/>
+    </marker>
+  </defs>
+  <!-- left: N-owned -->
+  <text x="230" y="28" text-anchor="middle" font-weight="600" fill="#1f2933">programs that own points (N-block), stream over G</text>
+  <text x="230" y="48" text-anchor="middle" fill="#52606d" font-size="13">deslice_fwd, *_bwd_n: out, dx_mid, dfx, delta, dtau</text>
+  <!-- the logical w matrix N x G -->
+  <rect x="60" y="70" width="340" height="260" fill="#f5f7fa" stroke="#9aa5b1"/>
+  <text x="230" y="350" text-anchor="middle" fill="#52606d" font-size="13">G slots →</text>
+  <text x="40" y="200" text-anchor="middle" fill="#52606d" font-size="13" transform="rotate(-90 40 200)">N points →</text>
+  <!-- one N-block row band -->
+  <rect x="60" y="150" width="340" height="44" fill="#dbe4f3" stroke="#3b5bdb"/>
+  <text x="230" y="178" text-anchor="middle" fill="#1f2933" font-size="13">one program: BN rows, all of G in blocks of GB</text>
+  <!-- G blocks ticks -->
+  <g stroke="#3b5bdb" stroke-dasharray="3 3">
+    <line x1="128" y1="150" x2="128" y2="194"/><line x1="196" y1="150" x2="196" y2="194"/>
+    <line x1="264" y1="150" x2="264" y2="194"/><line x1="332" y1="150" x2="332" y2="194"/>
+  </g>
+  <path d="M75,210 L385,210" stroke="#3b5bdb" stroke-width="2" marker-end="url(#arr2)"/>
+  <text x="230" y="230" text-anchor="middle" fill="#3b5bdb" font-size="13">recompute logits → exp → accumulate (BN, DV); row sum formed here</text>
+  <!-- right: G-owned -->
+  <text x="720" y="28" text-anchor="middle" font-weight="600" fill="#1f2933">programs that own slots (G-block), stream over N</text>
+  <text x="720" y="48" text-anchor="middle" fill="#52606d" font-size="13">slice_fwd_g, *_bwd_g: z_num, s, dW, db, dtokens</text>
+  <rect x="550" y="70" width="340" height="260" fill="#f5f7fa" stroke="#9aa5b1"/>
+  <text x="720" y="350" text-anchor="middle" fill="#52606d" font-size="13">G slots →</text>
+  <!-- one G-block column band -->
+  <rect x="686" y="70" width="68" height="260" fill="#e3f1e6" stroke="#2f855a"/>
+  <text x="720" y="200" text-anchor="middle" fill="#1f2933" font-size="13" transform="rotate(-90 720 200)">one program: GB slots, its share of N</text>
+  <g stroke="#2f855a" stroke-dasharray="3 3">
+    <line x1="686" y1="135" x2="754" y2="135"/><line x1="686" y1="200" x2="754" y2="200"/><line x1="686" y1="265" x2="754" y2="265"/>
+  </g>
+  <path d="M770,85 L770,315" stroke="#2f855a" stroke-width="2" marker-end="url(#arr2)"/>
+  <text x="820" y="200" text-anchor="middle" fill="#2f855a" font-size="13" transform="rotate(-90 820 200)">P partitions of N, partial sums, one .sum() on the host</text>
+  <!-- stats bar -->
+  <rect x="60" y="372" width="830" height="22" rx="4" fill="#fff7e6" stroke="#b7791f"/>
+  <text x="475" y="388" text-anchor="middle" fill="#744210" font-size="13">shared: per-point statistics (row max m, exponential sum l) — 2 floats per point and head, formed in one online pass, kept for the backward</text>
+</svg>

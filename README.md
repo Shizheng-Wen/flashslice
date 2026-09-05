@@ -14,6 +14,12 @@ It is deliberately not a training framework. There is no trainer, no data
 pipeline, no configs — just the model and the kernels, so they drop into
 whatever you already use.
 
+**Documentation:** <https://shizheng-wen.github.io/flashslice/> — the design
+(why slice/deslice is the cost, how the kernels stream it, the numerics gate),
+shapes and routing, the API, the measured numbers, and how to run the tests
+and sweeps. Tag `v0.1.0` is the tree the paper's numbers come from; `main`
+carries the extensions listed in the [changelog](docs/changelog.md).
+
 ## Install
 
 ```bash
@@ -52,14 +58,29 @@ fx = torch.randn(1, 200_000, 1, device="cuda")   # per-point features
 y  = model(x, fx)                                # [1, 200000, 4]
 ```
 
-The kernels are usable on their own:
+The kernels are usable on their own. `x_mid` `(B, N, H, D)` is what the
+membership is computed from, `fx_mid` `(B, N, H, DV)` what is pooled, `W` the
+slot projection, `b` a per-slot bias (or `None`), `tau` `(H,)` the temperature:
 
 ```python
 from flashslice.kernels import fused_slice, fused_deslice, unsupported_dims
 
+# slice first (Transolver's order); the deslice over the same membership
+# takes the slice's statistics and skips its own pass
 z_num, s, stats = fused_slice(x_mid, fx_mid, W, b, tau, return_stats=True)
-out = fused_deslice(x_mid, W, b, tau, tokens, stats=stats)   # stats optional
+tokens = mix(z_num / (s + 1e-5)[..., None])                  # (B, H, G, DV)
+out = fused_deslice(x_mid, W, b, tau, tokens, stats=stats)   # (B, N, H, DV)
+
+# deslice first (a persistent point stream); the deslice forms the
+# statistics in its own online pass and the slice that follows takes them
+out, stats = fused_deslice(x_mid, W, b, tau, tokens, return_stats=True)
+z_num, s = fused_slice(x_mid, fx_mid, W, b, tau, stats=stats)
 ```
+
+`W` may be `(G, D)`, `(H, G, D)` or `(B, H, G, D)` — shared, per head, or per
+sample and head, e.g. `W = k(tokens)` — and its gradient comes back in that
+shape; `b` likewise `None`, `(G,)`, `(H, G)` or `(B, H, G)`. `DV` may differ
+from `D` (a membership carrying positional channels next to narrower values).
 
 ### Precision
 
@@ -148,23 +169,26 @@ shape:
   `G`: using the `G=32` table at `G=128` costs up to 40–80× through register
   spilling, so the tables are keyed by `G` rather than shared.
 - **G-blocked kernels** serve every other shape: any `G` — the last block is
-  masked, so `G=8`, `G=48` and `G=512` all run — and any `D` up to 256,
-  padded to a power of two. They take the approach of FlashAttention's
-  *backward* rather than its forward. A small pass saves the per-point
-  softmax statistics of the slice logits — row max and sum of exponentials,
-  two floats per point and head, 2/`G` of `w` — and every kernel then
-  recomputes `w = exp(logit − m) / l` one `G`-block at a time.
-  FlashAttention's online softmax rescales an accumulator indexed by the
-  softmax's own row; deslice has that shape, but slice is its transpose —
-  accumulators per token, summed over points — and the saved-statistics
-  form is the one that serves both. Tokens, `dW` and `db` come from programs that
-  own a `G`-block and stream over `N`; `out`, `dxm` and `dfx` from programs
-  that own an `N`-block and stream over `G`. Still no atomics, still bitwise
-  deterministic, held to the same parity gate. The price is one extra read
-  of `x_mid` in the forward and one more logits recompute in the backward,
-  which is why routing prefers the single-tile kernels wherever they apply.
+  masked, so `G=8`, `G=48` and `G=512` all run — any `D` up to 256, padded
+  to a power of two, a value width `DV` apart from `D`, and weights per head
+  or per sample. They take the approach of FlashAttention's *backward*
+  rather than its forward. A small pass saves the per-point softmax
+  statistics of the slice logits — row max and sum of exponentials, two
+  floats per point and head, 2/`G` of `w` — in one online pass, and every
+  kernel then recomputes `w = exp(logit − m) / l` one `G`-block at a time. A
+  deslice with no statistics in hand forms its output and the statistics in
+  that same pass (FlashAttention's forward) and hands them to a tied slice.
+  Slice is the deslice's transpose — accumulators per token, summed over
+  points — so the saved-statistics form is the one that serves both. Tokens,
+  `dW` and `db` come from programs that own a `G`-block and stream over `N`;
+  `out`, `dxm` and `dfx` from programs that own an `N`-block and stream over
+  `G`. Still no atomics, still bitwise deterministic, held to the same parity
+  gate. The price is the statistics pass (none in the deslice-first order)
+  and one more logits recompute in the backward, which is why routing
+  prefers the single-tile kernels wherever they apply.
   `set_kernel_mode("blocked")` (or `FLASHSLICE_KERNEL_MODE=blocked`) forces
-  them, for timing and parity runs; `set_block_g` overrides the block size.
+  them, for timing and parity runs; `set_block_g` overrides the block size;
+  `set_stats_mode("two-pass")` restores the original max-then-sum statistics.
 
 Only `D > 256` is outside both. There the layer **falls back to the eager
 path and says so** — it logs a warning, sets `use_fused_slice = False` on the
@@ -289,21 +313,27 @@ matter, and it was the part that dominated memory.
 
 ```bash
 pytest tests/                       # dim contract, routing, visible fallback, eager equivalence
-python bench/parity_test.py         # fused vs eager, fp64-referenced, both kernel families
+python bench/parity_test.py         # the layer: fused vs eager, fp64-referenced, both families
+python bench/parity_ops.py          # the ops: weight layouts, value widths, both tied orders
 python bench/bench_layer.py --slices 256 --dtype bf16   # one layer, eager vs fused, any shape
 python bench/bench_kernels.py --defaults-only            # per-kernel time, bandwidth, TFLOP/s
 python bench/bench_kernels.py --family blocked --slices 256   # sweep the blocked kernels
 python bench/pick_tiles.py bench/results/sweep_*.json    # sweep results -> tile table entry
+python bench/launch_probe.py --slices 256 --dtype bf16 --dot bf16   # each kernel in its own process
 ```
 
 `bench/bench_kernels.py` reproduces the systems tables: it times eager against
 fused for the forward, the training step, and inference, and sweeps the tile
-configurations of either kernel family. `bench/bench_layer.py` times one
-layer, eager against fused, at any shape, including the ones only the blocked
-kernels serve. `bench/parity_test.py` checks that the fused path matches
+configurations of either kernel family at any shape (`--dim-head`,
+`--dim-value`, `--weight-shape`). `bench/bench_layer.py` times one layer,
+eager against fused, at any shape, including the ones only the blocked
+kernels serve. `bench/parity_test.py` checks that the fused layer matches
 eager to the precision class of its dot mode, against an fp64 reference; the
-`blk-tiny-N17` and `blk-g512` cases are the sensitive ones. The caveats that
-cost us time are in `bench/README.md`.
+`blk-tiny-N17` and `blk-g512` cases are the sensitive ones.
+`bench/parity_ops.py` holds the ops to the same gate on what the layer does
+not exercise. `bench/launch_probe.py` names the kernel behind a sticky CUDA
+error by launching each one in a fresh process. The caveats that cost us time
+are in `bench/README.md` and in the [documentation](https://shizheng-wen.github.io/flashslice/benchmarks/).
 
 ## License and attribution
 

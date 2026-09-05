@@ -1,0 +1,38 @@
+# Changelog
+
+## Unreleased (`main`)
+
+Extensions that came from using the kernels as the coupling of a point-cloud
+model with sample-specific anchors (see [Performance](performance.md#a-coupling-with-sample-specific-slots)).
+The single-tile kernels' numerical path is untouched; the blocked family
+changed and is re-gated.
+
+- **Weight layouts.** `weight` may be `(G, D)`, `(H, G, D)` or `(B, H, G, D)`;
+  `bias` `None`, `(G,)`, `(H, G)` or `(B, H, G)`. Read through strides, zero
+  where shared; `dW`/`db` come back in the parameter's shape and dtype.
+- **Value width apart from the logits width.** `fx_mid`, `tokens` and `out`
+  have their own width `DV` on the blocked family; unequal widths route
+  there. `unsupported_dims` and `single_tile_dims` take it as an optional
+  argument.
+- **One-pass statistics.** The blocked statistics kernel forms `(m, l)` in
+  one online pass. The point-owning kernels normalize with a row sum they
+  form themselves; the slot-owning kernels take the saved `l`.
+  `set_stats_mode("two-pass")` keeps the original form.
+- **Online deslice.** A deslice with no statistics forms `out` and `(m, l)`
+  in one pass; `fused_deslice(..., return_stats=True)` returns them and
+  `fused_slice(..., stats=)` takes them, so a tied coupling pays for the
+  membership once per op in either order.
+- **Reciprocals** instead of per-element divisions by `tau` and by the row
+  sum in the blocked kernels.
+- **Tile table** keys may carry the value width: `(G_block, D_tile, DV_tile)`.
+- **Bench**: `bench_kernels.py --dim-value --weight-shape --stages`, the new
+  kernels; `pick_tiles.py` emits three-element keys; `bench/parity_ops.py`.
+
+## v0.1.0 — the paper's tree
+
+The kernels as submitted with *Does Transolver Need a Transformer?*:
+single-tile fused slice/deslice for `G`, `D` powers of two in `[16, 128]`,
+the G-blocked kernels for every other shape, `ieee` / `tf32` / `bf16v` /
+`bf16` / `tf32x3` dot modes, the instrumented Transolver layer with the
+paper's ablation flags, the parity gate and the benches. Every number in the
+README of that tag is from it, on one GH200 under torch 2.5 / Triton 3.0.
