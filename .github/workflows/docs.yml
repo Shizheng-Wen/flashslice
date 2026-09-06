@@ -3,10 +3,11 @@ name: docs
 # Builds the MkDocs site from docs/ and publishes it to the gh-pages branch,
 # which GitHub Pages serves. Runs on every push to main that touches the docs
 # or this workflow, and on request.
+# While the repository is private the site stays unpublished: the branch is
+# deleted and this workflow runs only on request. Restore the push trigger
+# (branches: [main], paths: docs/**, mkdocs.yml, this file) when the
+# repository goes public with the paper.
 on:
-  push:
-    branches: [main]
-    paths: ["docs/**", "mkdocs.yml", ".github/workflows/docs.yml"]
   workflow_dispatch:
 
 permissions:
