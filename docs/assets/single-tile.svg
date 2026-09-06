@@ -1,0 +1,62 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 500" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="14">
+ <defs>
+ <marker id="arr-st" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+ <path d="M0,0 L10,5 L0,10 z" fill="#4b5563"/>
+ </marker>
+ </defs>
+ <text x="480" y="26" text-anchor="middle" font-weight="600" fill="#1f2933">Single-tile: one program holds the whole slot axis in registers</text>
+ <text x="480" y="46" text-anchor="middle" fill="#52606d" font-size="13">G and D are powers of two in [16, 128], DV = D. Softmax never leaves the tile. No statistics tensor.</text>
+
+ <!-- N x G matrix -->
+ <rect x="40" y="70" width="360" height="230" fill="#f5f7fa" stroke="#9aa5b1"/>
+ <text x="220" y="318" text-anchor="middle" fill="#52606d" font-size="13">G slots - (one tile, not blocked)</text>
+ <text x="22" y="185" text-anchor="middle" fill="#52606d" font-size="13" transform="rotate(-90 22 185)">N points -</text>
+ <!-- one program: full-width N-block -->
+ <rect x="40" y="150" width="360" height="50" fill="#dbe4f3" stroke="#3b5bdb" stroke-width="2"/>
+ <text x="220" y="172" text-anchor="middle" fill="#1f2933" font-size="13">one program: BLOCK_N rows x all of G</text>
+ <text x="220" y="190" text-anchor="middle" fill="#3b5bdb" font-size="12">logits, exp, l live here - not in HBM</text>
+ <!-- faint other programs -->
+ <rect x="40" y="90" width="360" height="28" fill="#e8eef7" stroke="#9aa5b1" opacity="0.7"/>
+ <rect x="40" y="230" width="360" height="28" fill="#e8eef7" stroke="#9aa5b1" opacity="0.7"/>
+ <text x="220" y="109" text-anchor="middle" fill="#52606d" font-size="11">other programs, other N-blocks</text>
+
+ <!-- register panel -->
+ <rect x="440" y="70" width="500" height="230" rx="8" fill="#fff" stroke="#4b5563"/>
+ <text x="690" y="92" text-anchor="middle" font-weight="600" fill="#1f2933">registers of that program</text>
+
+ <rect x="456" y="108" width="130" height="44" rx="6" fill="#e8eef7" stroke="#4b5563"/>
+ <text x="521" y="126" text-anchor="middle" fill="#1f2933" font-size="13">x_mid tile</text>
+ <text x="521" y="144" text-anchor="middle" fill="#52606d" font-size="12">(BN, D)</text>
+ <text x="602" y="134" text-anchor="middle" fill="#1f2933" font-size="16">x</text>
+ <rect x="616" y="108" width="110" height="44" rx="6" fill="#e8eef7" stroke="#4b5563"/>
+ <text x="671" y="126" text-anchor="middle" fill="#1f2933" font-size="13">W, b, tau</text>
+ <text x="671" y="144" text-anchor="middle" fill="#52606d" font-size="12">(G, D)  all of it</text>
+ <path d="M726,130 L758,130" stroke="#4b5563" stroke-width="2" marker-end="url(#arr-st)"/>
+ <rect x="760" y="108" width="160" height="44" rx="6" fill="#fff7e6" stroke="#4b5563"/>
+ <text x="840" y="126" text-anchor="middle" fill="#1f2933" font-size="13">logits then softmax</text>
+ <text x="840" y="144" text-anchor="middle" fill="#52606d" font-size="12">(BN, G) m, e, l</text>
+
+ <text x="690" y="176" text-anchor="middle" fill="#52606d" font-size="12">w is formed and consumed in this tile. Nothing of shape (N, G) is stored.</text>
+
+ <!-- two exits -->
+ <path d="M600,188 L520,218" stroke="#2f855a" stroke-width="2" marker-end="url(#arr-st)"/>
+ <path d="M780,188 L860,218" stroke="#3b5bdb" stroke-width="2" marker-end="url(#arr-st)"/>
+
+ <rect x="456" y="220" width="200" height="66" rx="6" fill="#e3f1e6" stroke="#2f855a"/>
+ <text x="556" y="242" text-anchor="middle" font-weight="600" fill="#1f2933" font-size="13">slice in the same tile</text>
+ <text x="556" y="260" text-anchor="middle" fill="#1f2933" font-size="12">z_num += w^T fx     s += sum_n w</text>
+ <text x="556" y="276" text-anchor="middle" fill="#52606d" font-size="12">partial (G, DV) -> host .sum()</text>
+
+ <rect x="724" y="220" width="200" height="66" rx="6" fill="#dbe4f3" stroke="#3b5bdb"/>
+ <text x="824" y="242" text-anchor="middle" font-weight="600" fill="#1f2933" font-size="13">deslice in the same tile</text>
+ <text x="824" y="260" text-anchor="middle" fill="#1f2933" font-size="12">out = w @ tokens</text>
+ <text x="824" y="276" text-anchor="middle" fill="#52606d" font-size="12">write the BN points, done</text>
+
+ <!-- bottom note -->
+ <rect x="40" y="350" width="900" height="130" rx="8" fill="#f5f7fa" stroke="#9aa5b1"/>
+ <text x="490" y="376" text-anchor="middle" font-weight="600" fill="#1f2933">Why this is the paper path</text>
+ <text x="80" y="404" fill="#1f2933">G is small enough that the softmax row fits in registers, so slice and deslice are the same program shape: own an N-block, see every slot at once.</text>
+ <text x="80" y="426" fill="#1f2933">Slice needing l_n before adding into a slot is free: l_n is computed from the whole row in the same tile.</text>
+ <text x="80" y="448" fill="#1f2933">No (m, l) tensor, one logits pass per op, tile tables keyed by G. Using the G = 32 table at G = 128 spills and can cost 40-80x.</text>
+ <text x="80" y="470" fill="#52606d">Four kernels: slice_fwd, deslice_fwd, slice_bwd, deslice_bwd. Backward recomputes the same tile.</text>
+</svg>

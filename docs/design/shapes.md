@@ -6,6 +6,10 @@
 
 ## Dimensions
 
+<figure markdown>
+![D is the membership width, DV the payload width, G the slot count; w of shape (B, H, N, G) is never written](../assets/tensors.svg)
+</figure>
+
 | symbol | meaning | tensor |
 | --- | --- | --- |
 | `B`, `N`, `H` | batch, points, heads | `x_mid` `(B, N, H, D)` |
@@ -40,6 +44,10 @@ parity and timing runs (`"single-tile"` raises on a shape it cannot serve
 rather than switching).
 
 ## Weight layouts
+
+<figure markdown>
+![Three layouts: (G, D) shared, (H, G, D) per head, (B, H, G, D) per sample; kernels read the rest through zero strides](../assets/weight-layouts.svg)
+</figure>
 
 | `weight` | `bias` | meaning |
 | --- | --- | --- |

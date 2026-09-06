@@ -71,6 +71,10 @@ at the end put 2–3× eager's error on it.
 
 ## Precision levels
 
+<figure markdown>
+![Dot modes: logits stay on the FMA path below bf16; value dots move to tensor cores first](../assets/dot-modes.svg)
+</figure>
+
 | level | logits dot | value dots | inputs | gate |
 | --- | --- | --- | --- | --- |
 | `ieee` | fp32 FMA | fp32 FMA | fp32 or bf16 | 1.25× eager fp32 |

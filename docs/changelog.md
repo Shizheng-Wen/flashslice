@@ -32,6 +32,9 @@ changed and is re-gated.
 - **Tile table** keys may carry the value width: `(G_block, D_tile, DV_tile)`.
 - **Bench**: `bench_kernels.py --dim-value --weight-shape --stages`, the new
   kernels; `pick_tiles.py` emits three-element keys; `bench/parity_ops.py`.
+- **Docs.** Figures for the single-tile path, blocked deslice (online softmax
+  over \(G\)), blocked slice (stream \(N\) with saved \((m,l)\)), tensor
+  anatomy, weight layouts, and the dot-mode split.
 
 ## v0.1.0 — the paper's tree
 

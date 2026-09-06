@@ -1,0 +1,73 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 380" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="14">
+ <defs>
+ <marker id="arr-tn" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+ <path d="M0,0 L10,5 L0,10 z" fill="#4b5563"/>
+ </marker>
+ </defs>
+ <text x="480" y="24" text-anchor="middle" font-weight="600" fill="#1f2933">The two widths and the one count</text>
+ <text x="480" y="44" text-anchor="middle" fill="#52606d" font-size="13">D decides membership. DV is the payload. G is how many slots. B, N, H sit on every tensor.</text>
+
+ <!-- point -->
+ <text x="160" y="78" text-anchor="middle" font-weight="600" fill="#1f2933">one point n</text>
+ <rect x="40" y="90" width="240" height="70" rx="8" fill="#e8eef7" stroke="#3b5bdb"/>
+ <text x="160" y="114" text-anchor="middle" fill="#1f2933">x_mid (B, N, H, D)</text>
+ <text x="160" y="136" text-anchor="middle" fill="#52606d" font-size="13">D channels -- which slot?</text>
+ <g>
+ <rect x="56" y="144" width="14" height="10" fill="#3b5bdb"/><rect x="74" y="144" width="14" height="10" fill="#3b5bdb"/>
+ <rect x="92" y="144" width="14" height="10" fill="#3b5bdb"/><rect x="110" y="144" width="14" height="10" fill="#3b5bdb"/>
+ <rect x="128" y="144" width="14" height="10" fill="#3b5bdb"/><rect x="146" y="144" width="14" height="10" fill="#3b5bdb"/>
+ <rect x="164" y="144" width="14" height="10" fill="#3b5bdb"/><rect x="182" y="144" width="14" height="10" fill="#3b5bdb"/>
+ <text x="220" y="154" fill="#3b5bdb" font-size="12">D</text>
+ </g>
+ <rect x="40" y="172" width="240" height="70" rx="8" fill="#e3f1e6" stroke="#2f855a"/>
+ <text x="160" y="196" text-anchor="middle" fill="#1f2933">fx_mid (B, N, H, DV)</text>
+ <text x="160" y="218" text-anchor="middle" fill="#52606d" font-size="13">DV channels - pooled / broadcast</text>
+ <g>
+ <rect x="80" y="226" width="14" height="10" fill="#2f855a"/><rect x="98" y="226" width="14" height="10" fill="#2f855a"/>
+ <rect x="116" y="226" width="14" height="10" fill="#2f855a"/><rect x="134" y="226" width="14" height="10" fill="#2f855a"/>
+ <rect x="152" y="226" width="14" height="10" fill="#2f855a"/><rect x="170" y="226" width="14" height="10" fill="#2f855a"/>
+ <text x="206" y="236" fill="#2f855a" font-size="12">DV</text>
+ </g>
+
+ <!-- slot -->
+ <text x="800" y="78" text-anchor="middle" font-weight="600" fill="#1f2933">one slot g (of G)</text>
+ <rect x="680" y="90" width="240" height="70" rx="8" fill="#e8eef7" stroke="#3b5bdb"/>
+ <text x="800" y="114" text-anchor="middle" fill="#1f2933">W[g] (.., G, D)</text>
+ <text x="800" y="136" text-anchor="middle" fill="#52606d" font-size="13">same D - the key for the dot</text>
+ <g>
+ <rect x="696" y="144" width="14" height="10" fill="#3b5bdb"/><rect x="714" y="144" width="14" height="10" fill="#3b5bdb"/>
+ <rect x="732" y="144" width="14" height="10" fill="#3b5bdb"/><rect x="750" y="144" width="14" height="10" fill="#3b5bdb"/>
+ <rect x="768" y="144" width="14" height="10" fill="#3b5bdb"/><rect x="786" y="144" width="14" height="10" fill="#3b5bdb"/>
+ <rect x="804" y="144" width="14" height="10" fill="#3b5bdb"/><rect x="822" y="144" width="14" height="10" fill="#3b5bdb"/>
+ <text x="860" y="154" fill="#3b5bdb" font-size="12">D</text>
+ </g>
+ <rect x="680" y="172" width="240" height="70" rx="8" fill="#e3f1e6" stroke="#2f855a"/>
+ <text x="800" y="196" text-anchor="middle" fill="#1f2933">token[g] (B, H, G, DV)</text>
+ <text x="800" y="218" text-anchor="middle" fill="#52606d" font-size="13">same DV - slice out, deslice in</text>
+ <g>
+ <rect x="720" y="226" width="14" height="10" fill="#2f855a"/><rect x="738" y="226" width="14" height="10" fill="#2f855a"/>
+ <rect x="756" y="226" width="14" height="10" fill="#2f855a"/><rect x="774" y="226" width="14" height="10" fill="#2f855a"/>
+ <rect x="792" y="226" width="14" height="10" fill="#2f855a"/><rect x="810" y="226" width="14" height="10" fill="#2f855a"/>
+ <text x="846" y="236" fill="#2f855a" font-size="12">DV</text>
+ </g>
+
+ <!-- middle: the two products -->
+ <path d="M280,125 L400,125" stroke="#3b5bdb" stroke-width="2" marker-end="url(#arr-tn)"/>
+ <path d="M560,125 L680,125" stroke="#3b5bdb" stroke-width="2"/>
+ <rect x="400" y="100" width="160" height="50" rx="8" fill="#fff7e6" stroke="#b7791f"/>
+ <text x="480" y="122" text-anchor="middle" fill="#1f2933" font-size="13">logit_ng = (x.W + b) / tau</text>
+ <text x="480" y="140" text-anchor="middle" fill="#52606d" font-size="12">dot of length D, G of them</text>
+
+ <path d="M280,207 L400,207" stroke="#2f855a" stroke-width="2" marker-end="url(#arr-tn)"/>
+ <path d="M560,207 L680,207" stroke="#2f855a" stroke-width="2"/>
+ <rect x="400" y="182" width="160" height="50" rx="8" fill="#e3f1e6" stroke="#2f855a"/>
+ <text x="480" y="204" text-anchor="middle" fill="#1f2933" font-size="13">slice / deslice mix</text>
+ <text x="480" y="222" text-anchor="middle" fill="#52606d" font-size="12">weighted sum of length DV</text>
+
+ <!-- w never written -->
+ <rect x="40" y="268" width="880" height="92" rx="8" fill="#fde8e8" stroke="#b91c1c" stroke-dasharray="6 4"/>
+ <text x="480" y="294" text-anchor="middle" font-weight="600" fill="#7f1d1d">membership w = softmax_g(logits) shape (B, H, N, G)</text>
+ <text x="480" y="316" text-anchor="middle" fill="#7f1d1d">eager writes it and keeps it for the backward - the only per-layer term that grows with G</text>
+ <text x="480" y="338" text-anchor="middle" fill="#7f1d1d">FlashSlice never writes it. Blocked path keeps 2 floats per point (m, l) instead - 2/G of w.</text>
+ <text x="480" y="368" text-anchor="middle" fill="#52606d" font-size="13">Paper: D = DV (head width). Anchor coupling: D = 56, DV = 32 - membership carries positional channels the values do not.</text>
+</svg>

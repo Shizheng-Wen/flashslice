@@ -58,9 +58,14 @@ out, stats = fused_deslice(x_mid, W, b, tau, tokens, return_stats=True)
 z_num, s = fused_slice(x_mid, fx_mid, W, b, tau, stats=stats)
 ```
 
+<figure markdown>
+![A tied coupling pays for the membership once per op once the deslice can hand (m, l) to the slice](assets/passes.svg)
+</figure>
+
 `weight` may be `(G, D)`, `(H, G, D)` or `(B, H, G, D)`; `bias` `None`,
 `(G,)`, `(H, G)` or `(B, H, G)`. A per-sample weight computed from a token
 stream gets its gradient back through the op. `DV` may differ from `D`.
+See [Shapes and routing](design/shapes.md) for the layouts drawn out.
 
 ## Precision
 
@@ -68,13 +73,9 @@ Inputs are fp32, or bf16 under `torch.autocast`. Parameters stay fp32 and
 accumulation is fp32 in every mode; what varies is the precision of the dots,
 chosen with `set_dot_mode(...)` or `FLASHSLICE_DOT_MODE`:
 
-| mode | dots | error against fp64 | use it for |
-| --- | --- | --- | --- |
-| `ieee` (default) | all fp32, on the FMA units | eager fp32's own | the paper's shapes; anything that must match eager |
-| `tf32` | value dots on tensor cores, logits fp32 | ~5e-4 on outputs | fp32 inputs at large `G` |
-| `bf16v` | value dots bf16, logits fp32 (16-bit inputs) | between the two | — |
-| `bf16` | all dots bf16 (16-bit inputs) | eager bf16 autocast's own | bf16 training at large `G` |
-| `tf32x3` | every dot as three tf32 products on tensor cores | 3–7× eager fp32's | fp32 inputs at large `G` when tf32's noise is too much |
+<figure markdown>
+![Which dots run on FMA units and which on tensor cores, per set_dot_mode](assets/dot-modes.svg)
+</figure>
 
 The logits dot stays fp32 below the `bf16` level because the softmax Jacobian
 amplifies noise in the slice weights. At the paper's shapes the default is also

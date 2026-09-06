@@ -10,14 +10,22 @@ with fake implementations for tracing.
 `flashslice/kernels/slice_ops.py`. Each program owns a block of `BLOCK_N`
 points and holds the *whole* slot axis \(G\) and head width \(D\) in one tile,
 so the softmax over slots is register-local: max, exponentials and the
-normalizer never leave the tile. Four kernels — slice forward, deslice
-forward, slice backward, deslice backward — with tile configurations tuned per
-\(G\) (using the \(G = 32\) table at \(G = 128\) costs up to 40–80× through
-register spilling). They serve \(D\) and \(G\) that are powers of two in
-\([16, 128]\) with equal value width, which is every shape the paper reports,
-and they are the measured, frozen path. The slot-owning quantities of the
-slice (\(z\), \(s\), \(dW\), \(db\)) come from per-program partial sums
-reduced on the host with one `.sum()`: no atomics.
+normalizer never leave the tile.
+
+<figure markdown>
+![Single-tile: one program holds every slot in registers; slice and deslice consume w in that tile](../assets/single-tile.svg)
+</figure>
+
+Four kernels — slice forward, deslice forward, slice backward, deslice
+backward — with tile configurations tuned per \(G\) (using the \(G = 32\)
+table at \(G = 128\) costs up to 40–80× through register spilling). They
+serve \(D\) and \(G\) that are powers of two in \([16, 128]\) with equal
+value width, which is every shape the paper reports, and they are the
+measured, frozen path. The slot-owning quantities of the slice (\(z\),
+\(s\), \(dW\), \(db\)) come from per-program partial sums reduced on the
+host with one `.sum()`: no atomics. There is no statistics tensor: \(l_n\)
+is computed from the whole row in the same tile, so slice's "need the row
+normalizer before adding into a slot" is free.
 
 ## G-blocked kernels
 
@@ -47,11 +55,36 @@ slots. Every other kernel recomputes \(w_{ng} = \exp(\text{logit}_{ng} - m_n) /
 l_n\) one block at a time. The statistics are kept for the backward.
 
 **The online deslice.** A deslice with no statistics in hand does not run the
-statistics pass first: it runs FlashAttention's forward, rescaling its
-accumulator and row sum whenever the row max moves, and stores the \((m, l)\)
-it ends with. Handed to a slice over the same membership
-(`fused_slice(..., stats=)`), that slice skips its own statistics pass. A tied
-coupling therefore pays for the membership once per op in either order:
+statistics pass first: it runs FlashAttention's forward. Softmax axis and
+reduction axis are the same (\(G\)), so three registers per point — the
+running max \(m\), the shifted sum \(l\), the unnormalized output \(O\) —
+are enough. A new G-block that raises the max rescales \(l\) and \(O\) by
+\(\exp(m_{\mathrm{old}}-m_{\mathrm{new}})\); old slots are not reread. The
+pass ends with \(\mathrm{out}=O/l\) and writes \((m,l)\).
+
+<figure markdown>
+![Blocked deslice: a program owns an N-block, streams G, and keeps m, l, O in registers](../assets/blocked-deslice.svg)
+</figure>
+
+Handed to a slice over the same membership (`fused_slice(..., stats=)`),
+those statistics skip the slice's own statistics pass. A tied coupling
+therefore pays for the membership once per op in either order:
+
+**Blocked slice.** Slice cannot do that loop. Its accumulators \(z_g\),
+\(s_g\) live on slots and mix many points; each point has its own \(m_n\).
+Updating one point's max cannot rescale a shared \(z_g\). So \((m,l)\) are
+an *input*. Programs own a G-block and stream over \(N\): for each N-tile
+they load the finished statistics, recompute \(w\) for those slots only,
+add \(w^{\top} fx\) into the running \(z,s\), and drop the tile. Partials
+are reduced on the host; column normalization \(z = z_{\mathrm{num}}/(s+\varepsilon)\)
+waits until all of \(N\).
+
+<figure markdown>
+![Blocked slice: a program owns a G-block, streams N, and reads finished (m, l) per point](../assets/blocked-slice.svg)
+</figure>
+
+A tied coupling in either order therefore looks like this — the membership
+is paid once per op, not once per statistics pass plus once per apply:
 
 <figure markdown>
 ![Passes over the membership per tied coupling, before and after the online statistics](../assets/passes.svg)

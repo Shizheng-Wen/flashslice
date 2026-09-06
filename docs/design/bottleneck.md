@@ -19,6 +19,10 @@ same weights read the other way). \(z \to z'\) is whatever mixes the tokens:
 self-attention in Transolver, a constant linear map in the paper's
 `no_token_attention` variant, which loses nothing.
 
+<figure markdown>
+![The membership matrix: deslice reads a row (attention); slice reads a column (the transpose, then a column sum)](../assets/membership-read.svg)
+</figure>
+
 ## Where the memory goes
 
 The eager implementation materializes \(w\), shape \((B, H, N, G)\), and keeps

@@ -1,0 +1,72 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 520" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="14">
+ <defs>
+ <marker id="arr-bs" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+ <path d="M0,0 L10,5 L0,10 z" fill="#4b5563"/>
+ </marker>
+ <marker id="arr-bs-g" viewBox="0 0 10 10" refX="9" refY="5" markerWidth="8" markerHeight="8" orient="auto-start-reverse">
+ <path d="M0,0 L10,5 L0,10 z" fill="#2f855a"/>
+ </marker>
+ </defs>
+ <text x="480" y="26" text-anchor="middle" font-weight="600" fill="#1f2933">Blocked slice: own a G-block, stream N, statistics already known</text>
+ <text x="480" y="46" text-anchor="middle" fill="#52606d" font-size="13">Softmax axis is still G; reduction axis is N. w_ng needs the finished (m_n, l_n) before a point may be added into any slot.</text>
+
+ <!-- stats strip -->
+ <rect x="40" y="68" width="36" height="220" fill="#fff7e6" stroke="#b7791f"/>
+ <text x="58" y="178" text-anchor="middle" fill="#744210" font-size="12" transform="rotate(-90 58 178)">(m, l) per point - 2 floats, from a prior online pass or a tied deslice</text>
+
+ <!-- matrix -->
+ <rect x="76" y="68" width="400" height="220" fill="#f5f7fa" stroke="#9aa5b1"/>
+ <text x="276" y="306" text-anchor="middle" fill="#52606d" font-size="13">G slots -></text>
+ <text x="58" y="300" fill="#52606d" font-size="11">N -></text>
+ <rect x="236" y="68" width="72" height="220" fill="#e3f1e6" stroke="#2f855a" stroke-width="2"/>
+ <text x="272" y="178" text-anchor="middle" fill="#1f2933" font-size="13" transform="rotate(-90 272 178)">one program: GB slots</text>
+ <g stroke="#2f855a" stroke-dasharray="3 3">
+ <line x1="236" y1="123" x2="308" y2="123"/>
+ <line x1="236" y1="178" x2="308" y2="178"/>
+ <line x1="236" y1="233" x2="308" y2="233"/>
+ </g>
+ <path d="M330,80 L330,270" stroke="#2f855a" stroke-width="2" marker-end="url(#arr-bs-g)"/>
+ <text x="400" y="178" text-anchor="middle" fill="#2f855a" font-size="12" transform="rotate(-90 400 178)">streaming loop over N -> this program never sees the other slots</text>
+
+ <!-- per-step box -->
+ <rect x="500" y="68" width="440" height="220" rx="8" fill="#fff" stroke="#4b5563"/>
+ <text x="720" y="92" text-anchor="middle" font-weight="600" fill="#1f2933">each N-tile, this G-block only</text>
+ <rect x="520" y="108" width="120" height="40" rx="6" fill="#fff7e6" stroke="#b7791f"/>
+ <text x="580" y="126" text-anchor="middle" fill="#1f2933" font-size="12">load m_n, l_n</text>
+ <text x="580" y="142" text-anchor="middle" fill="#52606d" font-size="11">already final</text>
+ <path d="M640,128 L668,128" stroke="#4b5563" stroke-width="2" marker-end="url(#arr-bs)"/>
+ <rect x="670" y="108" width="150" height="40" rx="6" fill="#e8eef7" stroke="#4b5563"/>
+ <text x="745" y="126" text-anchor="middle" fill="#1f2933" font-size="12">logits for these GB</text>
+ <text x="745" y="142" text-anchor="middle" fill="#52606d" font-size="11">x_mid . W_block / tau</text>
+ <path d="M820,128 L848,128" stroke="#4b5563" stroke-width="2" marker-end="url(#arr-bs)"/>
+ <rect x="850" y="108" width="70" height="40" rx="6" fill="#e3f1e6" stroke="#2f855a"/>
+ <text x="885" y="126" text-anchor="middle" fill="#1f2933" font-size="12">w</text>
+ <text x="885" y="142" text-anchor="middle" fill="#52606d" font-size="11">e / l</text>
+
+ <text x="720" y="172" text-anchor="middle" fill="#1f2933" font-size="13">w = exp(logit - m) / l then immediately</text>
+ <rect x="520" y="186" width="190" height="48" rx="6" fill="#e3f1e6" stroke="#2f855a"/>
+ <text x="615" y="206" text-anchor="middle" fill="#1f2933" font-size="13">acc_z += w^T @ fx</text>
+ <text x="615" y="224" text-anchor="middle" fill="#52606d" font-size="12">(GB, DV) running sum</text>
+ <rect x="730" y="186" width="190" height="48" rx="6" fill="#e3f1e6" stroke="#2f855a"/>
+ <text x="825" y="206" text-anchor="middle" fill="#1f2933" font-size="13">acc_s += sum_n w</text>
+ <text x="825" y="224" text-anchor="middle" fill="#52606d" font-size="12">(GB,) column mass</text>
+ <text x="720" y="258" text-anchor="middle" fill="#52606d" font-size="12">The (BN, GB) tile of w is dropped. It is never written to HBM.</text>
+
+ <!-- why not online over G -->
+ <rect x="40" y="330" width="440" height="120" rx="8" fill="#fde8e8" stroke="#b91c1c"/>
+ <text x="260" y="354" text-anchor="middle" font-weight="600" fill="#7f1d1d">Why this is not an online-over-G loop</text>
+ <text x="60" y="380" fill="#7f1d1d" font-size="13">acc_z lives on slots and mixes many points. Each point has its own m_n.</text>
+ <text x="60" y="400" fill="#7f1d1d" font-size="13">Updating one point's max cannot rescale the whole z_g - that would</text>
+ <text x="60" y="420" fill="#7f1d1d" font-size="13">corrupt every other point already added. So (m, l) are an input,</text>
+ <text x="60" y="440" fill="#7f1d1d" font-size="13">not a running state of this kernel. _slice_fwd_g_kernel.</text>
+
+ <rect x="500" y="330" width="440" height="120" rx="8" fill="#e3f1e6" stroke="#2f855a"/>
+ <text x="720" y="354" text-anchor="middle" font-weight="600" fill="#1f2933">After the N loop</text>
+ <text x="520" y="380" fill="#1f2933" font-size="13">Each program writes a partial (GB, DV) and (GB,).</text>
+ <text x="520" y="400" fill="#1f2933" font-size="13">The host reduces with one deterministic .sum() over the</text>
+ <text x="520" y="420" fill="#1f2933" font-size="13">N-partition axis - no atomics. Then, outside the kernel:</text>
+ <text x="520" y="440" fill="#1f2933" font-size="13">z = z_num / (s + eps). Column normalize waits until all of N.</text>
+
+ <rect x="40" y="466" width="900" height="40" rx="6" fill="#fff7e6" stroke="#b7791f"/>
+ <text x="490" y="492" text-anchor="middle" fill="#744210" font-size="13">Where (m, l) come from: compute_stats (one online pass over G, stats only), or fused_deslice(..., return_stats=True). Tied deslice-first pays for the membership once.</text>
+</svg>

@@ -20,8 +20,8 @@ memory, and the layer's memory stops growing with the token count.
 - **Two kernel families** behind one pair of ops, `fused_slice` and
   `fused_deslice`. The single-tile kernels serve the paper's shapes and hold the
   whole slot axis in registers. The G-blocked kernels serve every other shape,
-  any slot count, and stream the membership in blocks the way FlashAttention's
-  backward does.
+  any slot count: deslice streams \(G\) with an online softmax, slice streams
+  \(N\) with saved \((m,l)\). See [The kernels](design/kernels.md).
 - **The Transolver layer and model**, instrumented with every ablation the paper
   reports, so `use_fused_slice=True` is an implementation switch and not a model
   change: outputs match the eager path and checkpoints interchange.

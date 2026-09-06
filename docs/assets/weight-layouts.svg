@@ -1,0 +1,42 @@
+<svg xmlns="http://www.w3.org/2000/svg" viewBox="0 0 960 300" font-family="ui-sans-serif, system-ui, -apple-system, Segoe UI, Roboto, Helvetica, Arial, sans-serif" font-size="14">
+ <text x="480" y="24" text-anchor="middle" font-weight="600" fill="#1f2933">Weight layouts - one tensor, zero-stride where shared</text>
+ <text x="480" y="44" text-anchor="middle" fill="#52606d" font-size="13">Kernels read W through batch and head strides. dW comes back in the parameter's shape, so W = k(tokens) trains.</text>
+
+ <!-- col 1 -->
+ <rect x="30" y="64" width="290" height="210" rx="8" fill="#e8eef7" stroke="#4b5563"/>
+ <text x="175" y="88" text-anchor="middle" font-weight="600" fill="#1f2933">(G, D)</text>
+ <text x="175" y="108" text-anchor="middle" fill="#52606d" font-size="13">shared - Transolver</text>
+ <rect x="90" y="124" width="170" height="44" rx="6" fill="#dbe4f3" stroke="#3b5bdb"/>
+ <text x="175" y="152" text-anchor="middle" fill="#1f2933">one W</text>
+ <text x="175" y="188" text-anchor="middle" fill="#1f2933" font-size="13">broadcast over B and H</text>
+ <text x="175" y="210" text-anchor="middle" fill="#52606d" font-size="12">bias (G,) or None</text>
+ <text x="175" y="248" text-anchor="middle" fill="#52606d" font-size="12">learned Linear(D -> G)</text>
+
+ <!-- col 2 -->
+ <rect x="335" y="64" width="290" height="210" rx="8" fill="#fff7e6" stroke="#4b5563"/>
+ <text x="480" y="88" text-anchor="middle" font-weight="600" fill="#1f2933">(H, G, D)</text>
+ <text x="480" y="108" text-anchor="middle" fill="#52606d" font-size="13">per head</text>
+ <rect x="365" y="124" width="70" height="36" rx="4" fill="#f6e05e" stroke="#b7791f"/>
+ <rect x="447" y="124" width="70" height="36" rx="4" fill="#f6e05e" stroke="#b7791f"/>
+ <rect x="529" y="124" width="70" height="36" rx="4" fill="#f6e05e" stroke="#b7791f"/>
+ <text x="400" y="148" text-anchor="middle" fill="#1f2933" font-size="12">h=0</text>
+ <text x="482" y="148" text-anchor="middle" fill="#1f2933" font-size="12">h=1</text>
+ <text x="564" y="148" text-anchor="middle" fill="#1f2933" font-size="12">h=...</text>
+ <text x="480" y="188" text-anchor="middle" fill="#1f2933" font-size="13">broadcast over B only</text>
+ <text x="480" y="210" text-anchor="middle" fill="#52606d" font-size="12">bias (H, G)</text>
+ <text x="480" y="248" text-anchor="middle" fill="#52606d" font-size="12">each head its own slots</text>
+
+ <!-- col 3 -->
+ <rect x="640" y="64" width="290" height="210" rx="8" fill="#e3f1e6" stroke="#4b5563"/>
+ <text x="785" y="88" text-anchor="middle" font-weight="600" fill="#1f2933">(B, H, G, D)</text>
+ <text x="785" y="108" text-anchor="middle" fill="#52606d" font-size="13">per sample and head</text>
+ <rect x="670" y="120" width="110" height="56" rx="4" fill="#9ae6b4" stroke="#2f855a"/>
+ <text x="725" y="144" text-anchor="middle" fill="#1f2933" font-size="12">sample 0</text>
+ <text x="725" y="162" text-anchor="middle" fill="#52606d" font-size="11">H x (G, D)</text>
+ <rect x="790" y="120" width="110" height="56" rx="4" fill="#9ae6b4" stroke="#2f855a"/>
+ <text x="845" y="144" text-anchor="middle" fill="#1f2933" font-size="12">sample 1</text>
+ <text x="845" y="162" text-anchor="middle" fill="#52606d" font-size="11">H x (G, D)</text>
+ <text x="785" y="202" text-anchor="middle" fill="#1f2933" font-size="13">no broadcast - W = k(anchors)</text>
+ <text x="785" y="224" text-anchor="middle" fill="#52606d" font-size="12">bias (B, H, G)</text>
+ <text x="785" y="252" text-anchor="middle" fill="#52606d" font-size="12">gradient flows back through dW</text>
+</svg>
