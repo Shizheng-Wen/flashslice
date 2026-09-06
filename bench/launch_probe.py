@@ -82,12 +82,11 @@ def _child(a):
     gg = (NGB, P, B * H)
     stats_kernel = (fb._stats_kernel if fb.stats_mode() == "online"
                     else fb._stats_twopass_kernel)
-    kwg = dict(kw, W_RN=fb._W_RN)
     launches = {
         "stats": lambda: stats_kernel[gn](
             xm, W, bias, tau, stats2, N, G, H, *wb, *sx, **kw),
         "slice_fwd_g": lambda: fb._slice_fwd_g_kernel[gg](
-            xm, fx, W, bias, tau, stats, pz, ps, N, G, P, H, *wb, *sx, *sf, **kwg),
+            xm, fx, W, bias, tau, stats, pz, ps, N, G, P, H, *wb, *sx, *sf, **kw),
         "deslice_fwd_n": lambda: fb._deslice_fwd_n_kernel[gn](
             xm, W, bias, tau, tok, stats, out, N, G, H, *wb, *sx, *so, **kw),
         "deslice_fwd_online": lambda: fb._deslice_fwd_online_kernel[gn](
@@ -97,13 +96,13 @@ def _child(a):
             N, G, H, *wb, *sx, *sf, **kw),
         "slice_bwd_g": lambda: fb._slice_bwd_g_kernel[gg](
             xm, fx, W, bias, tau, stats, delta, dzn, ds, pdw, pdb,
-            N, G, P, H, *wb, *sx, *sf, **kwg),
+            N, G, P, H, *wb, *sx, *sf, **kw),
         "deslice_bwd_n": lambda: fb._deslice_bwd_n_kernel[gn](
             xm, W, bias, tau, tok, stats, dout, dxm, delta, pdt,
             N, G, H, *wb, *sx, *so, **kw),
         "deslice_bwd_g": lambda: fb._deslice_bwd_g_kernel[gg](
             xm, W, bias, tau, tok, stats, delta, dout, pdtok, pdw, pdb,
-            N, G, P, H, *wb, *sx, *so, **kwg),
+            N, G, P, H, *wb, *sx, *so, **kw),
     }
     launches[a.kernel]()
     torch.cuda.synchronize()
