@@ -65,7 +65,8 @@ def _child(a):
     stats2 = torch.empty_like(stats)
     delta = torch.zeros(B, H, N, device="cuda")
 
-    bn, warps, stages = fb._launch_cfg(a.kernel, xm, dot, GB, DT, DVT)
+    bn, warps, stages, GB = fb._launch_cfg(a.kernel, xm, dot, GB, DT, DVT)
+    NGB = triton.cdiv(G, GB)
     bn = a.bn or bn
     warps = a.warps or warps
     stages = a.stages or stages

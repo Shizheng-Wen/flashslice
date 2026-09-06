@@ -188,6 +188,23 @@ def test_cfg_blk_prefers_value_width_entry():
         fb._CFG_BLK.update(saved)
 
 
+def test_launch_cfg_per_kernel_block():
+    """A four-element entry gives the kernel its own G-block; a three-element
+    one keeps the family default."""
+    from flashslice.kernels import blocked as fb
+
+    saved = dict(fb._CFG_BLK)
+    t = torch.empty(1, 8, 4, 56, dtype=torch.bfloat16)
+    try:
+        fb._CFG_BLK[(64, 64, 32)] = {"slice_bwd_g": {(True, 3): (32, 4, 3, 32)},
+                                     "slice_bwd_n": {(True, 3): (64, 4, 1)}}
+        assert fb._launch_cfg("slice_bwd_g", t, 3, 64, 64, 32) == (32, 4, 3, 32)
+        assert fb._launch_cfg("slice_bwd_n", t, 3, 64, 64, 32) == (64, 4, 1, 64)
+    finally:
+        fb._CFG_BLK.clear()
+        fb._CFG_BLK.update(saved)
+
+
 def test_stats_mode_switch():
     from flashslice.kernels import blocked as fb
 

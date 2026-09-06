@@ -63,9 +63,11 @@ sweeps on one GH200 at `N = 262k`:
   entry per kernel and (input dtype, dot level).
 - `blocked._CFG_BLK`, keyed by `(G_block, D_tile)` or
   `(G_block, D_tile, DV_tile)`; the key with the value width is looked up
-  first. Where a key is missing the blocked kernels borrow the single-tile
-  table for `G = G_block` (`blocked._FAMILY`), with `BLOCK_N` scaled by
-  `32 / D_tile` — a heuristic, not a measurement.
+  first. An entry may carry a fourth element, a G-block of its own for that
+  kernel (the slot-owning backward kernels prefer a smaller block than the
+  kernels that stream over `G`). Where a key is missing the blocked kernels
+  borrow the single-tile table for `G = G_block` (`blocked._FAMILY`), with
+  `BLOCK_N` scaled by `32 / D_tile` — a heuristic, not a measurement.
 
 The blocked kernels are far more tile-sensitive than the single-tile ones:
 with borrowed tiles two of them ran 9–11× slower than their single-tile twins

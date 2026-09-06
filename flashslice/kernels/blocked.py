@@ -881,8 +881,10 @@ def _deslice_bwd_g_kernel(
 #   (64, 64, 32): job 3304527 (G=1024, D=56, DV=32, bf16).
 _CFG_BLK = {
     # (64, 64, 32): D=56 -> 64 logits width, 32 value width, bf16 dots -- the
-    # anchor-keyed coupling of TANGO v2; job 3304527 (G=1024, N=262k, one
-    # dtype/dot). The wider G-block is what tiles() picks on tensor-core paths.
+    # anchor-keyed coupling of TANGO v2; jobs 3304527 / 3304654 (G=1024,
+    # N=262k, one dtype/dot). The wider G-block is what tiles() picks on
+    # tensor-core paths; the slot-owning backward kernels keep a block of 32
+    # (fourth element), 9.4 / 12.6 ms against 12.5 / 13.3 on the wider one.
     (64, 64, 32): {
         "stats": {
             (True, 3): (256, 8, 1),
@@ -900,13 +902,13 @@ _CFG_BLK = {
             (True, 3): (64, 4, 1),
         },
         "slice_bwd_g": {
-            (True, 3): (64, 4, 1),
+            (True, 3): (32, 4, 3, 32),
         },
         "deslice_bwd_n": {
             (True, 3): (64, 4, 2),
         },
         "deslice_bwd_g": {
-            (True, 3): (64, 4, 1),
+            (True, 3): (32, 4, 3, 32),
         },
     },
     (32, 32): {
@@ -1067,9 +1069,15 @@ _FAMILY = {
 
 
 def _launch_cfg(kernel, t, dot, gb, dt, dvt=None):
-    """(BLOCK_N, num_warps, num_stages) for a blocked kernel."""
+    """(BLOCK_N, num_warps, num_stages, G_block) for a blocked kernel. The
+    table is keyed by the family's default G-block ``gb``; an entry with a
+    fourth element gives that kernel its own block (the slot-owning backward
+    kernels prefer a smaller one than the kernels that stream over G)."""
     cfg = _cfg_blk(kernel, t.dtype != torch.float32, dot, gb, dt, dvt)
-    bn, warps, stages = cfg or _cfg(_FAMILY[kernel], t, dot, gb, dt)
+    if cfg and len(cfg) == 4:
+        bn, warps, stages, gb = cfg
+    else:
+        bn, warps, stages = cfg or _cfg(_FAMILY[kernel], t, dot, gb, dt)
     stages = _stages(dot, stages)
     if dot and warps > 4 and (kernel.endswith(("_bwd_n", "_bwd_g"))
                               or kernel == "deslice_fwd_online"):
@@ -1082,7 +1090,7 @@ def _launch_cfg(kernel, t, dot, gb, dt, dvt=None):
         # accumulator is rescaled between dots). The other forward kernels
         # on 8 warps compiled and ran in the same sweeps.
         warps = 4
-    return bn, warps, stages
+    return bn, warps, stages, gb
 
 
 def _consts(D, G, dt, gb, bn, dot, warps, stages, dv=None):
@@ -1106,7 +1114,7 @@ def compute_stats(x_mid, weight, bias, tau, dot=0):
     [..., 0, :] the row max, [..., 1, :] the sum of exponentials."""
     B, N, H, D, G = _bh_dims(x_mid, weight)
     dt, gb = tiles(D, G, dot)
-    bn, warps, stages = _launch_cfg("stats", x_mid, dot, gb, dt)
+    bn, warps, stages, gb = _launch_cfg("stats", x_mid, dot, gb, dt)
     stats = torch.empty(B, H, 2, N, device=x_mid.device, dtype=torch.float32)
     weight, bias, tau = weight.contiguous(), bias.contiguous(), tau.contiguous()
     wb = _wb_layout(weight, bias, B, H)
@@ -1127,10 +1135,10 @@ def _slice_blk_impl(x_mid, fx_mid, weight, bias, tau, stats, dot):
     else:
         stats = stats.contiguous()
     dt, gb = tiles(D, G, dot)
-    ngb = triton.cdiv(G, gb)
     DV = fx_mid.shape[3]
-    bn, warps, stages = _launch_cfg("slice_fwd_g", x_mid, dot, gb, dt,
-                                    _pow2_at_least_16(DV))
+    bn, warps, stages, gb = _launch_cfg("slice_fwd_g", x_mid, dot, gb, dt,
+                                        _pow2_at_least_16(DV))
+    ngb = triton.cdiv(G, gb)
     P = _n_programs(N, B * H * ngb, bn)
     part_z = torch.empty(B * H * P, G, DV, device=x_mid.device,
                          dtype=torch.float32)
@@ -1151,21 +1159,21 @@ def _slice_blk_bwd_impl(x_mid, fx_mid, weight, bias, tau, stats, dz_num, ds,
     stats = stats.contiguous()
     dz_num = dz_num.contiguous().float()
     ds = ds.contiguous().float()
-    dt, gb = tiles(D, G, dot)
-    ngb = triton.cdiv(G, gb)
+    dt, gb0 = tiles(D, G, dot)
     dxm = torch.empty_like(x_mid)
     dfx = torch.empty_like(fx_mid)
     delta = torch.empty(B, H, N, device=x_mid.device, dtype=torch.float32)
     DV = fx_mid.shape[3]
     dvt = _pow2_at_least_16(DV)
-    bn, warps, stages = _launch_cfg("slice_bwd_n", x_mid, dot, gb, dt, dvt)
+    bn, warps, stages, gb = _launch_cfg("slice_bwd_n", x_mid, dot, gb0, dt, dvt)
     nprog = triton.cdiv(N, bn)
     pdt = torch.empty(B * H * nprog, device=x_mid.device, dtype=torch.float32)
     _slice_bwd_n_kernel[(nprog, B * H)](
         x_mid, fx_mid, weight, bias, tau, stats, dz_num, ds, dxm, dfx, delta,
         pdt, N, G, H, *wb, *_strides(x_mid), *_strides(fx_mid),
         **_consts(D, G, dt, gb, bn, dot, warps, stages, DV))
-    bn, warps, stages = _launch_cfg("slice_bwd_g", x_mid, dot, gb, dt, dvt)
+    bn, warps, stages, gb = _launch_cfg("slice_bwd_g", x_mid, dot, gb0, dt, dvt)
+    ngb = triton.cdiv(G, gb)
     P = _n_programs(N, B * H * ngb, bn)
     pdw = torch.empty(B * H * P, G, D, device=x_mid.device, dtype=torch.float32)
     pdb = torch.empty(B * H * P, G, device=x_mid.device, dtype=torch.float32)
@@ -1183,14 +1191,14 @@ def _deslice_blk_impl(x_mid, weight, bias, tau, tokens, stats, dot):
     weight, bias, tau = weight.contiguous(), bias.contiguous(), tau.contiguous()
     wb = _wb_layout(weight, bias, B, H)
     tokens = tokens.contiguous()
-    dt, gb = tiles(D, G, dot)
+    dt, gb0 = tiles(D, G, dot)
     DV = tokens.shape[3]
     dvt = _pow2_at_least_16(DV)
     out = torch.empty(B, N, H, DV, device=x_mid.device, dtype=x_mid.dtype)
     if stats is None and _STATS_MODE == "online":
         # No statistics in hand: one online pass forms out and (m, l) both.
         stats = torch.empty(B, H, 2, N, device=x_mid.device, dtype=torch.float32)
-        bn, warps, stages = _launch_cfg("deslice_fwd_online", x_mid, dot, gb, dt, dvt)
+        bn, warps, stages, gb = _launch_cfg("deslice_fwd_online", x_mid, dot, gb0, dt, dvt)
         _deslice_fwd_online_kernel[(triton.cdiv(N, bn), B * H)](
             x_mid, weight, bias, tau, tokens, stats, out,
             N, G, H, *wb, *_strides(x_mid), *_strides(out),
@@ -1200,7 +1208,7 @@ def _deslice_blk_impl(x_mid, weight, bias, tau, tokens, stats, dot):
         stats = compute_stats(x_mid, weight, bias, tau, dot)
     else:
         stats = stats.contiguous()
-    bn, warps, stages = _launch_cfg("deslice_fwd_n", x_mid, dot, gb, dt, dvt)
+    bn, warps, stages, gb = _launch_cfg("deslice_fwd_n", x_mid, dot, gb0, dt, dvt)
     _deslice_fwd_n_kernel[(triton.cdiv(N, bn), B * H)](
         x_mid, weight, bias, tau, tokens, stats, out,
         N, G, H, *wb, *_strides(x_mid), *_strides(out),
@@ -1215,20 +1223,20 @@ def _deslice_blk_bwd_impl(x_mid, weight, bias, tau, tokens, stats, d_out, dot):
     tokens = tokens.contiguous()
     d_out = d_out.contiguous()
     stats = stats.contiguous()
-    dt, gb = tiles(D, G, dot)
-    ngb = triton.cdiv(G, gb)
+    dt, gb0 = tiles(D, G, dot)
     dxm = torch.empty_like(x_mid)
     delta = torch.empty(B, H, N, device=x_mid.device, dtype=torch.float32)
     DV = tokens.shape[3]
     dvt = _pow2_at_least_16(DV)
-    bn, warps, stages = _launch_cfg("deslice_bwd_n", x_mid, dot, gb, dt, dvt)
+    bn, warps, stages, gb = _launch_cfg("deslice_bwd_n", x_mid, dot, gb0, dt, dvt)
     nprog = triton.cdiv(N, bn)
     pdt = torch.empty(B * H * nprog, device=x_mid.device, dtype=torch.float32)
     _deslice_bwd_n_kernel[(nprog, B * H)](
         x_mid, weight, bias, tau, tokens, stats, d_out, dxm, delta, pdt,
         N, G, H, *wb, *_strides(x_mid), *_strides(d_out),
         **_consts(D, G, dt, gb, bn, dot, warps, stages, DV))
-    bn, warps, stages = _launch_cfg("deslice_bwd_g", x_mid, dot, gb, dt, dvt)
+    bn, warps, stages, gb = _launch_cfg("deslice_bwd_g", x_mid, dot, gb0, dt, dvt)
+    ngb = triton.cdiv(G, gb)
     P = _n_programs(N, B * H * ngb, bn)
     pdtok = torch.empty(B * H * P, G, DV, device=x_mid.device,
                         dtype=torch.float32)

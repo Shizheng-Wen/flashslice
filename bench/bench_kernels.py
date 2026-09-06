@@ -257,7 +257,9 @@ def main():
 
             def default_cfg(kname, dot):
                 if a.family == "blocked":
-                    return fb._launch_cfg(kname, xm, dot, GB, DT, DVT)
+                    # the sweep's block size is fixed for the run; a table
+                    # entry's own block (fourth element) is not applied here
+                    return fb._launch_cfg(kname, xm, dot, GB, DT, DVT)[:3]
                 bn, warps, stages = fs._cfg(kname, xm, dot, G, D)
                 if kname != "deslice_fwd":
                     stages = fs._stages(dot, stages)
