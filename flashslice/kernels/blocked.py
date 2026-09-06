@@ -227,9 +227,12 @@ def _rcp(x):
 
 @triton.jit
 def _scaled(x, inv_tau, DOT: tl.constexpr):
-    """x / tau on the FMA paths, x itself on the tensor-core paths: the
-    operand of the logits dot that carries the temperature there (see
-    _logits). Called once per program on the operand that is loaded once."""
+    """x / tau on the FMA paths, x itself on the tensor-core paths: the x_mid
+    operand of the logits dot, which carries the temperature there (see
+    _logits). Once per program in the kernels that own points, once per
+    point tile in the kernels that own slots -- scaling the weight block
+    instead, though loaded once, met the transpose in the dot and cost
+    slice_fwd_g 2x (job 3304722)."""
     if DOT >= 3:
         return x
     else:
@@ -240,9 +243,8 @@ def _scaled(x, inv_tau, DOT: tl.constexpr):
 def _logits(xm, w_mat, bias, inv_tau, DOT: tl.constexpr):
     """(BN, GB) slice logits (x . W + b) / tau: bias before the temperature,
     as eager. On the tensor-core paths the tile is scaled by the reciprocal
-    after the dot. On the FMA paths the caller has scaled one operand with
-    _scaled (x_mid in the kernels that own points, the weight block in the
-    kernels that own slots) and only the bias is scaled here: a broadcast
+    after the dot. On the FMA paths the caller has scaled x_mid with _scaled
+    and only the bias is scaled here: a broadcast
     multiply on the (BN, GB) tile changed the layout Triton 3.0 gave it and
     cost the FMA dot its vectorized operand (3-60x, jobs 3304466, 3304526),
     while the approximate division Triton's ``/`` lowers to is biased enough
@@ -429,7 +431,6 @@ def _slice_fwd_g_kernel(
     gmask = offs_g < G
     w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
     inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
-    w_l = _scaled(w_mat, inv_tau, DOT)
 
     acc_z = tl.zeros((GB, DVT), dtype=tl.float32)
     acc_s = tl.zeros((GB,), dtype=tl.float32)
@@ -441,7 +442,7 @@ def _slice_fwd_g_kernel(
                         sxb, sxn, sxh, sxd, PAD_D)
         m, l = _load_stats(STATS, bh64, N, offs_n64)
         inv_l = _rcp(l)
-        e = _expw(_logits(xm, w_l, bias, inv_tau, DOT), m)
+        e = _expw(_logits(_scaled(xm, inv_tau, DOT), w_mat, bias, inv_tau, DOT), m)
         if PAD_G:
             e = tl.where(nmask[:, None] & gmask[None, :], e, 0.0)
         else:
@@ -702,7 +703,6 @@ def _slice_bwd_g_kernel(
     w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
     tau = tl.load(TAU + h).to(tl.float32)
     inv_tau = _rcp(tau)
-    w_l = _scaled(w_mat, inv_tau, DOT)
     dzn = _load_tok(DZN, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
     ds = _load_vec(DS + bh64 * G, offs_g, G)
 
@@ -718,7 +718,7 @@ def _slice_bwd_g_kernel(
                         sfb, sfn, sfh, sfd, PAD_V)
         m, l = _load_stats(STATS, bh64, N, offs_n64)
         delta = _load_vec(DELTA + bh64 * N, offs_n64, N)
-        e = _expw(_logits(xm, w_l, bias, inv_tau, DOT), m)
+        e = _expw(_logits(_scaled(xm, inv_tau, DOT), w_mat, bias, inv_tau, DOT), m)
         if PAD_G:
             e = tl.where(nmask[:, None] & gmask[None, :], e, 0.0)
         else:
@@ -845,7 +845,6 @@ def _deslice_bwd_g_kernel(
     w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
     tau = tl.load(TAU + h).to(tl.float32)
     inv_tau = _rcp(tau)
-    w_l = _scaled(w_mat, inv_tau, DOT)
     tok = _load_tok(TOK, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
 
     acc_dtok = tl.zeros((GB, DVT), dtype=tl.float32)
@@ -861,7 +860,7 @@ def _deslice_bwd_g_kernel(
                           sob, son, soh, sod, PAD_V)
         m, l = _load_stats(STATS, bh64, N, offs_n64)
         delta = _load_vec(DELTA + bh64 * N, offs_n64, N)
-        e = _expw(_logits(xm, w_l, bias, inv_tau, DOT), m)
+        e = _expw(_logits(_scaled(xm, inv_tau, DOT), w_mat, bias, inv_tau, DOT), m)
         if PAD_G:
             e = tl.where(nmask[:, None] & gmask[None, :], e, 0.0)
         else:

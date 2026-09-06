@@ -250,6 +250,30 @@ Reading it:
   the single-tile 1.72×: the statistics pass and the extra logits recompute
   in the backward, and nothing else.
 
+### A coupling with sample-specific slots
+
+The extensions on `main` came from using the kernels as the coupling of a
+point-cloud model whose slots are physical anchor points of each sample:
+weight `(1, H, G, D)` computed from the anchors' token embeddings, `D = 56`
+(32 content + 24 positional channels), `DV = 32`, `H = 8`, `N = 265k`, bf16
+dots, the deslice run first and its statistics handed to the slice. One
+coupling round (deslice + slice, forward + backward) on one GH200, tag
+`v0.1.0` plus the weight and value-width extension against `main`:
+
+| `G` | v0.1.0 kernels | `main` | |
+| --- | --- | --- | --- |
+| 256 | 30.8 ms | 14.6 ms | **2.1×** |
+| 1024 | 107 ms | 48.3 ms | **2.2×** |
+| 2048 | 208 ms | 93.1 ms | **2.2×** |
+
+Three things add up to it: the one-pass statistics and the online deslice
+take the membership from six logits passes per tied coupling to two in the
+forward; the tile table has an entry for the shape (it used to borrow the
+single-tile `G = 32` tiles with an untested `BLOCK_N` heuristic); and on
+tensor-core paths the `G`-block is 64 rather than 32 at `D_tile = 64`. The
+`ieee` path at this shape is 1.25× faster than before (one-pass statistics),
+and the paper's shapes are unchanged within noise.
+
 ## Ablations
 
 Every variant in the paper is one flag on `Transolver`, and at most one may be

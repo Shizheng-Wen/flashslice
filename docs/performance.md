@@ -95,7 +95,33 @@ kernels at tag `v0.1.0` plus the weight/value-width extension:
 - `bf16` dots matched a `tf32` control at every step of a 50k-step training
   run, at 3.5× less step time.
 
-!!! info "Numbers for the online statistics and the tuned tiles"
-    The re-measurement of this shape with the one-pass statistics, the online
-    deslice and a swept tile entry for `(G_block=32, D_tile=64, DV_tile=32)`
-    is in progress; this section is updated when the jobs land.
+### After the 2026-09 round
+
+One coupling round (deslice first, its statistics handed to the slice;
+forward + backward), `N = 265k`, `H = 8`, `D = 56`, `DV = 32`, bf16 dots,
+medians of five, one GH200:
+
+| `G` | v0.1.0 kernels (+ weight/value-width extension) | `main` | |
+| --- | --- | --- | --- |
+| 256 | 30.8 ms | 14.6 ms | **2.1×** |
+| 1024 | 107 ms | 48.3 ms | **2.2×** |
+| 2048 | 208 ms | 93.1 ms | **2.2×** |
+
+Per kernel at `G = 1024` (ms, bf16 dots), before → after:
+
+| kernel | before | after | what changed |
+| --- | --- | --- | --- |
+| statistics | 9.3 (two passes) | 2.6 | one online pass; tiles |
+| deslice, no statistics in hand | 9.3 + 5.9 | 2.2 | the online kernel forms both |
+| slice forward | 17.5 | 6.5 | tiles, `G`-block 64 |
+| slice backward, points | 18.3 | 8.1 | tiles, `G`-block 64 |
+| slice backward, slots | 10.0 | 9.7 | tiles |
+| deslice backward, points | 21.4 | 7.0 | tiles, `G`-block 64 |
+| deslice backward, slots | 14.9 | 13–15 | tiles |
+
+The slot-owning backward kernels are now the largest share of the round;
+they stream over `N` in `P` partitions and their tiles were swept at one
+`N`, so they are where the next round of tuning goes. The `ieee` path at
+this shape gained 1.25× from the one-pass statistics; the paper's shapes
+(`D = 32`, `G = 32` single-tile and `G = 256` blocked) are unchanged within
+noise, layer-level, in every dot mode.
