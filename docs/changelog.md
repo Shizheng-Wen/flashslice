@@ -21,10 +21,11 @@ changed and is re-gated.
   in one pass; `fused_deslice(..., return_stats=True)` returns them and
   `fused_slice(..., stats=)` takes them, so a tied coupling pays for the
   membership once per op in either order.
-- **Correctly rounded reciprocals** (`div_rn`) for `1/tau` and `1/l` in
-  place of per-element divisions; on the FMA paths the factors are applied
-  to the operand rows and the accumulators rather than the logits tile,
-  whose broadcast multiply cost the FMA dot 6–60×.
+- **Correctly rounded reciprocals** (`div_rn`) for `1/tau` and `1/l` where
+  the temperature gradient can see them; on the FMA paths the temperature
+  rides on the once-loaded operand of the logits dot and the normalizers on
+  `dl` and the accumulators, the slot-owning kernels keep dividing their
+  tile (the one form whose transposed FMA dot stays fast).
 - **Wider G-block on tensor-core paths.** `tiles(D, G, dot)` allows
   `GB * D_tile <= 4096` there (2048 on FMA paths); a swept
   `(G_block=64, D_tile=64, DV_tile=32)` entry serves the anchor-coupling shape.

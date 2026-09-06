@@ -54,11 +54,15 @@ it was the only one that did. Three rules came out of it:
    independently rounded product into the identity and cost 1.5–1.9× eager on
    \(d\tau\); the algebraically equal \(f_n \cdot df_n + w_n \cdot ds\) (one
    dot cheaper) cost 3×.
-4. **The divisors are correctly rounded.** \(1/l_n\) and \(1/\tau\) are
-   `div_rn` reciprocals. Triton's `/` lowers to the approximate `div.full`,
-   whose error is systematic per divisor; with the same divisor in every
-   term of a row that is exactly the coherent deviation the identity cannot
-   absorb, and it cost 2–14× eager on \(d\tau\) and 2× on \(dx_{mid}\).
+4. **The divisors that reach the temperature gradient are correctly
+   rounded.** \(1/l_n\) and \(1/\tau\) in the kernels that own points, and the
+   temperature in the logits everywhere, are `div_rn` reciprocals. Triton's
+   `/` lowers to the approximate `div.full`, whose error is systematic; on
+   the logits it cost 8–14× eager on \(d\tau\) and 2× on \(dx_{mid}\). The
+   kernels that own slots still divide with it — their gradients (\(dW\),
+   \(db\), the tokens') take a per-row factor as a relative perturbation,
+   and the gate confirms it — because it is the one form whose transposed
+   FMA dot stays fast.
 
 And the temperature gradient itself is summed **row by row over all of
 \(G\)** before anything is added across rows, in the point-owning kernel.

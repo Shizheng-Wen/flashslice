@@ -88,16 +88,21 @@ a tensor-core mode to pull ahead of eager ([Performance](../performance.md)).
 For one \((n, g)\) pair and head, a forward pass does one logits multiply-add
 chain of length \(D\), one exponential, one value multiply-add chain of length
 \(D_V\), and a handful of fp32 operations: the shift by \(m_n\), the mask
-where the last block is padded, and the per-point factors \(1/\tau\) and
-\(1/l_n\). Those factors are correctly rounded reciprocals (`div_rn`): Triton's
-`/` is the approximate `div.full`, and with the same rounded divisor in every
-term of a row it put 2–14× eager's error on the temperature gradient. Where
-they are applied depends on the dot path. On the tensor-core paths they
-multiply the (BN, GB) tile. On the FMA paths a broadcast multiply on that
-tile changed the layout Triton 3.0 gave it and cost the FMA dot its
-vectorized operand, 6–60×; so there the temperature scales \(x_{mid}\) and
-the bias before the dot, the row normalizer scales the value or \(x_{mid}\)
-rows that feed the transposed dots, and the accumulators are scaled once at
-the end. At
+where the last block is padded, and the factors \(1/\tau\) and \(1/l_n\).
+Where and how those are applied was settled by measurement, because Triton
+3.0 makes two things expensive on the FMA paths and one thing wrong. Wrong:
+Triton's `/` is the approximate `div.full`, and applied to the logits its
+bias put 8–14× eager's error on the temperature gradient. Expensive: a
+broadcast multiply on the (BN, GB) tile that feeds a transposed FMA dot, or
+a scaling of that dot's other operand, changed the layout Triton gave the
+tile and cost the dot its vectorized operand, 6–60×. So on the FMA paths the
+temperature goes, as a correctly rounded reciprocal, onto the operand of the
+logits dot that a program loads once (\(x_{mid}\) in the kernels that own
+points, the weight block in the kernels that own slots); the kernels that
+own points normalize with correctly rounded reciprocals applied to `dl` and
+to the accumulators; and the kernels that own slots divide their tile by
+\(l_n\) and \(\tau\) with Triton's division, whose per-row bias the gradients
+they produce absorb as a relative perturbation. On the tensor-core paths the
+tile simply multiplies the reciprocals. At
 \(D + D_V \approx 90\) the exponential is the second cost after the dots, the
 same limit FlashAttention-3 meets at small head dimensions.
