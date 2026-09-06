@@ -303,10 +303,12 @@ def main():
                         # Triton 3.0's loop pipeliner segfaults compiling async
                         # tf32 dots (uncatchable); bf16 dots survive.
                         continue
-                    if dot and warps > 4 and "bwd" in kname:
+                    if dot and warps > 4 and ("bwd" in kname
+                                              or kname == "deslice_fwd_online"):
                         # Triton 3.0 aborts (assert) on an mma -> mma layout
-                        # conversion in backward kernels with tensor-core
-                        # dots on 8 warps (blocked._launch_cfg, slice_ops._cfg).
+                        # conversion in backward kernels and in the online
+                        # deslice with tensor-core dots on 8 warps
+                        # (blocked._launch_cfg, slice_ops._cfg).
                         continue
                     tag = "{}/bn{}w{}s{}/{}".format(
                         kname, bn, warps, stages, _DOT_NAME[dot])
