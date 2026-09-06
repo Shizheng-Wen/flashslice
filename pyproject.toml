@@ -1,0 +1,29 @@
+[build-system]
+requires = ["setuptools>=77"]
+build-backend = "setuptools.build_meta"
+
+[project]
+name = "flashslice"
+version = "0.0.1"
+description = "Placeholder for FlashSlice, fused Triton kernels for the slice/deslice bottleneck of physics-attention. The kernels ship with the paper; this release holds the eager reference of the operators."
+readme = "README.md"
+license = "Apache-2.0"
+license-files = ["LICENSE"]
+authors = [
+    {name = "Shizheng Wen", email = "shizheng.wen@sam.math.ethz.ch"},
+]
+requires-python = ">=3.9"
+keywords = ["triton", "physics-attention", "transolver", "neural-operator"]
+classifiers = [
+    "Development Status :: 1 - Planning",
+    "Intended Audience :: Science/Research",
+    "Programming Language :: Python :: 3",
+    "Topic :: Scientific/Engineering",
+]
+dependencies = ["torch>=2.4"]
+
+[project.urls]
+Homepage = "https://github.com/Shizheng-Wen/flashslice"
+
+[tool.setuptools.packages.find]
+include = ["flashslice*"]
