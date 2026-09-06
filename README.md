@@ -18,7 +18,8 @@ whatever you already use.
 (why slice/deslice is the cost, how the kernels stream it, the numerics gate),
 shapes and routing, the API, the measured numbers, and how to run the tests
 and sweeps. Tag `v0.1.0` is the tree the paper's numbers come from; `main`
-carries the extensions listed in the [changelog](docs/changelog.md).
+carries the extensions listed in the [changelog](docs/changelog.md);
+[ROADMAP.md](ROADMAP.md) says what comes next.
 
 ## Install
 
@@ -144,7 +145,7 @@ checkpointing:
 The constant factor is not the interesting part. What changes is how the layer
 *scales*:
 
-![Memory and time against slice count and depth](assets/F4_systems.png)
+![Memory and time against slice count and depth](https://raw.githubusercontent.com/Shizheng-Wen/flashslice/main/assets/F4_systems.png)
 
 - **Memory is flat in the slice count.** From `G=16` to `G=128` the fused layer
   moves 15.42 → 15.43 GB while eager goes 17.92 → 36.89 GB (bf16). The tensor
@@ -299,7 +300,7 @@ that the load-bearing structure is the *coupling* — alternating full-resolutio
 pointwise MLPs with the slice/deslice bottleneck — and not the self-attention
 among slice tokens.
 
-![Ablation ratios across eight benchmarks](assets/F1_money.png)
+![Ablation ratios across eight benchmarks](https://raw.githubusercontent.com/Shizheng-Wen/flashslice/main/assets/F1_money.png)
 
 Best validation relative L¹ across eight benchmarks in fluid dynamics and
 industrial aerodynamics, up to 1.4×10⁸ mesh points. Three seeds for the first

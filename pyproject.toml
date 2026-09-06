@@ -4,7 +4,7 @@ build-backend = "setuptools.build_meta"
 
 [project]
 name = "flashslice"
-version = "0.2.0.dev0"
+version = "0.2.0"
 description = "Fused Triton kernels for the slice/deslice bottleneck of physics-attention, and the Transolver layer they accelerate."
 readme = "README.md"
 license = "Apache-2.0"
@@ -13,14 +13,34 @@ authors = [
     {name = "Shizheng Wen", email = "shizheng.wen@sam.math.ethz.ch"},
 ]
 requires-python = ">=3.9"
+keywords = ["triton", "flash-attention", "physics-attention", "transolver", "neural-operator", "point-cloud", "cfd"]
+classifiers = [
+    "Development Status :: 4 - Beta",
+    "Intended Audience :: Science/Research",
+    "License :: OSI Approved :: Apache Software License",
+    "Programming Language :: Python :: 3",
+    "Programming Language :: Python :: 3 :: Only",
+    "Topic :: Scientific/Engineering",
+    "Topic :: Scientific/Engineering :: Artificial Intelligence",
+    "Environment :: GPU :: NVIDIA CUDA",
+    "Operating System :: POSIX :: Linux",
+]
 dependencies = [
     "torch>=2.4",
     "triton>=3.0",
     "einops",
 ]
 
+[project.urls]
+Homepage = "https://github.com/Shizheng-Wen/flashslice"
+Documentation = "https://shizheng-wen.github.io/flashslice/"
+Repository = "https://github.com/Shizheng-Wen/flashslice"
+Changelog = "https://shizheng-wen.github.io/flashslice/changelog/"
+Issues = "https://github.com/Shizheng-Wen/flashslice/issues"
+
 [project.optional-dependencies]
 dev = ["pytest"]
+docs = ["mkdocs>=1.6", "mkdocs-material>=9.5", "pymdown-extensions>=10.8"]
 
 [tool.setuptools.packages.find]
 include = ["flashslice*"]

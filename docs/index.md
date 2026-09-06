@@ -50,5 +50,6 @@ memory, and the layer's memory stops growing with the token count.
 ## Status
 
 Developed and measured on NVIDIA GH200 under torch 2.5 / Triton 3.0. Tag
-`v0.1.0` is the tree the paper's numbers come from; `main` carries the
-extensions listed in the [changelog](changelog.md). Apache-2.0.
+`v0.1.0` is the tree the paper's numbers come from; `v0.2.0` adds the
+extensions listed in the [changelog](changelog.md), and the
+[roadmap](roadmap.md) says what comes next. Apache-2.0.
