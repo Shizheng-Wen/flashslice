@@ -42,7 +42,7 @@ def _child(a):
     dt = torch.float32 if a.dtype == "fp32" else torch.bfloat16
     dot = DOT[a.dot]
     fb.set_block_g(a.block_g)
-    DT, GB = fb.tiles(D, G)
+    DT, GB = fb.tiles(D, G, dot)
     DVT = fb._pow2_at_least_16(DV)
     NGB = triton.cdiv(G, GB)
     torch.manual_seed(0)

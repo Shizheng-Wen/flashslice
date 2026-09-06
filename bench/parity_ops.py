@@ -35,7 +35,7 @@ import torch
 from flashslice.kernels import (fused_deslice, fused_slice, set_dot_mode,
                                 set_kernel_mode, set_stats_mode, single_tile_dims,
                                 stats_mode)
-from flashslice.kernels.blocked import compute_stats, set_fma_div
+from flashslice.kernels.blocked import compute_stats
 
 CASE_FILTER = []
 
@@ -393,21 +393,16 @@ def main():
     ap.add_argument("--orders", action="store_true", help="run the call-order probe")
     ap.add_argument("--time", action="store_true", help="time the TANGO coupling shape")
     ap.add_argument("--n", type=int, default=4097)
-    ap.add_argument("--fma-div", type=int, default=None,
-                    help="form of the per-element divisions on the FMA dot paths (0..3)")
     ap.add_argument("--cases", default="",
                     help="comma-separated substrings; run only the cases whose name matches")
     a = ap.parse_args()
     import triton
     if a.stats_mode:
         set_stats_mode(a.stats_mode)
-    if a.fma_div is not None:
-        set_fma_div(a.fma_div)
     CASE_FILTER.extend(f for f in a.cases.split(",") if f)
-    from flashslice.kernels import blocked as _fb
-    print("torch {}  triton {}  {}  stats mode {}  fma_div {}".format(
+    print("torch {}  triton {}  {}  stats mode {}".format(
         torch.__version__, triton.__version__, torch.cuda.get_device_name(0),
-        stats_mode(), _fb._FMA_DIV), flush=True)
+        stats_mode()), flush=True)
     torch.backends.cuda.matmul.allow_tf32 = False
     n = a.n
     # the upstream path, unchanged: leaf (G, D) weights on both families

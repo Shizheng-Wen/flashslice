@@ -135,7 +135,10 @@ def main():
     DT = GB = DVT = None
     if a.family == "blocked":
         fb.set_block_g(a.block_g)
-        DT, GB = fb.tiles(D, G)
+        # the block size follows the dot path (tiles); a sweep runs one dot
+        # level per file, so the first requested level sets it here
+        first_dot = {"ieee": 0, "tf32": 1, "bf16": 3, "tf32x3": 4}[a.dots.split(",")[0]]
+        DT, GB = fb.tiles(D, G, first_dot)
         DVT = fb._pow2_at_least_16(DV)
         NGB = triton.cdiv(G, GB)
         print("blocked family: D_tile={} G_block={} DV_tile={} ({} block(s)), "
@@ -350,7 +353,8 @@ def _dump(a, B, H, D, DV, G, results, best):
     dims = {"B": B, "H": H, "D": D, "DV": DV, "G": G, "family": a.family,
             "weight_shape": a.weight_shape}
     if a.family == "blocked":
-        dims["D_tile"], dims["G_block"] = fb.tiles(a.dim_head, a.slices)
+        first_dot = {"ieee": 0, "tf32": 1, "bf16": 3, "tf32x3": 4}[a.dots.split(",")[0]]
+        dims["D_tile"], dims["G_block"] = fb.tiles(a.dim_head, a.slices, first_dot)
         dims["DV_tile"] = fb._pow2_at_least_16(DV)
         dims["stats_mode"] = fb.stats_mode()
     with open(a.out, "w") as f:

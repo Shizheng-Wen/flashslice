@@ -65,11 +65,22 @@ def test_kernel_mode_switch():
     (32, 48, 32, 64),     # one masked block
     (32, 8, 32, 16),      # G below the dot minimum: one padded block
     (24, 40, 32, 64),     # D padded to 32
-    (64, 256, 64, 32),    # wider head, smaller G-block
+    (64, 256, 64, 32),    # wider head, smaller G-block on the FMA paths
     (256, 32, 256, 16),   # widest head: G-block at the minimum
 ])
 def test_blocked_tiles(d, g, dt, gb):
     assert tiles(d, g) == (dt, gb)
+
+
+@pytest.mark.parametrize("d,g,dot,gb", [
+    (56, 1024, 3, 64),    # tensor-core dots: the 4096 budget allows GB=64 at DT=64
+    (56, 1024, 0, 32),    # FMA dots: the 2048 budget
+    (56, 1024, 4, 64),
+    (128, 256, 3, 32),    # DT=128: 4096 / 128
+    (32, 256, 3, 64),     # capped at 64 either way
+])
+def test_blocked_tiles_by_dot(d, g, dot, gb):
+    assert tiles(d, g, dot)[1] == gb
 
 
 def _layer(g, d=32, heads=8):

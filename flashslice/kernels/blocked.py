@@ -85,7 +85,8 @@ _BLOCK_G = None  # None = choose from D; set_block_g overrides
 
 def set_block_g(gb):
     """Force the G-block size (a power of two >= 16), or None for automatic:
-    the largest of 16..64 that keeps GB * D_tile <= 2048."""
+    the largest of 16..64 that keeps GB * D_tile within the budget of the dot
+    path (2048 on the FMA paths, 4096 on the tensor-core paths)."""
     global _BLOCK_G
     if gb is not None and (gb < 16 or (gb & (gb - 1)) != 0):
         raise ValueError("block size must be a power of two >= 16, got %r" % gb)
@@ -118,22 +119,16 @@ def stats_mode():
     return _STATS_MODE
 
 
-# The form of the per-element divisions on the FMA dot paths (see _over_tau);
-# for attribution, 0 is the production form.
-_FMA_DIV = int(os.environ.get("FLASHSLICE_FMA_DIV", "0"))
-
-
-def set_fma_div(level):
-    global _FMA_DIV
-    if level not in (0, 1, 2, 3):
-        raise ValueError("FMA division form must be 0..3, got %r" % (level,))
-    _FMA_DIV = int(level)
-
-
-def tiles(d, g):
-    """(D_tile, G_block) for the blocked kernels at head width d, slice count g."""
+def tiles(d, g, dot=0):
+    """(D_tile, G_block) for the blocked kernels at head width d, slice count
+    g and dot level ``dot``. The block budget GB * D_tile is 2048 on the FMA
+    paths (register-bound fp32 tiles) and 4096 on the tensor-core paths,
+    where a wider G-block at D_tile = 64 measured 1.5-2.2x faster on the
+    kernels that stream over G (job 3304527: slice_fwd_g 6.1 against 13.7 ms,
+    deslice_bwd_n 7.2 against 12.4, N = 262k, G = 1024, bf16)."""
     dt = _pow2_at_least_16(d)
-    gb = _BLOCK_G or max(16, min(64, 2048 // dt))
+    budget = 4096 if dot >= 3 else 2048
+    gb = _BLOCK_G or max(16, min(64, budget // dt))
     return dt, min(gb, _pow2_at_least_16(g))
 
 
@@ -222,41 +217,26 @@ def _store_part(P, val, idx, offs_g, offs_d, gmask, dmask, G, D: tl.constexpr,
 
 
 @triton.jit
-def _over_tau(x, tau, inv_tau, DOT: tl.constexpr, FMA_DIV: tl.constexpr):
-    """x / tau. On the tensor-core paths (bf16, tf32x3 logits) a multiply by
-    the reciprocal formed once per program. On the FMA paths FMA_DIV picks
-    the form (attribution, job 3304466 vs 3304497): 0 the division, 1 the
-    reciprocal multiply, 2 a correctly rounded division, 3 a multiply by a
-    correctly rounded reciprocal."""
-    if DOT >= 3 or FMA_DIV == 1:
-        return x * inv_tau
-    elif FMA_DIV == 2:
-        return tl.math.div_rn(x, tau)
-    elif FMA_DIV == 3:
-        return x * tl.math.div_rn(1.0, tau)
-    else:
-        return x / tau
+def _rcp(x):
+    """1 / x, correctly rounded (libdevice div_rn). Triton's ``/`` lowers to
+    the approximate div.full, whose per-element error is systematic enough
+    to put 2-14x eager's error on the temperature gradient and 2x on dx once
+    the same rounded divisor enters every term of a row (job 3304526)."""
+    return tl.math.div_rn(1.0, x)
 
 
 @triton.jit
-def _over_rows(x, l, inv_l, DOT: tl.constexpr, FMA_DIV: tl.constexpr):
-    """x (BN, C) divided row by row by l (BN,): the reciprocal on the
-    tensor-core paths, on the FMA paths the form FMA_DIV picks (_over_tau)."""
-    if DOT >= 3 or FMA_DIV == 1:
-        return x * inv_l[:, None]
-    elif FMA_DIV == 2:
-        return tl.math.div_rn(x, l[:, None])
-    elif FMA_DIV == 3:
-        return x * tl.math.div_rn(1.0, l)[:, None]
+def _logits(xm, xm_s, w_mat, bias, inv_tau, DOT: tl.constexpr):
+    """(BN, GB) slice logits (x . W + b) / tau: bias before the temperature,
+    as eager. On the tensor-core paths the tile is scaled after the dot; on
+    the FMA paths the scaled x_mid ``xm_s`` (formed once per tile) and a
+    scaled bias go into the dot instead -- a broadcast multiply on the
+    (BN, GB) tile changed the layout Triton 3.0 gave it and cost the FMA dot
+    its vectorized operand, 3-60x (jobs 3304466, 3304526)."""
+    if DOT >= 3:
+        return (_dot_w(xm, tl.trans(w_mat), DOT) + bias[None, :]) * inv_tau
     else:
-        return x / l[:, None]
-
-
-@triton.jit
-def _logits(xm, w_mat, bias, tau, inv_tau, DOT: tl.constexpr, FMA_DIV: tl.constexpr):
-    """(BN, GB) slice logits: bias before the temperature, as eager."""
-    return _over_tau(_dot_w(xm, tl.trans(w_mat), DOT) + bias[None, :], tau, inv_tau,
-                     DOT, FMA_DIV)
+        return _dot_w(xm_s, tl.trans(w_mat), DOT) + (bias * inv_tau)[None, :]
 
 
 @triton.jit
@@ -276,12 +256,6 @@ def _expw(lg, m):
 
 
 @triton.jit
-def _weights(lg, m, l, inv_l, DOT: tl.constexpr, FMA_DIV: tl.constexpr):
-    """Softmax rows from logits and statistics: exp(lg - m) / l."""
-    return _over_rows(tl.exp(lg - m[:, None]), l, inv_l, DOT, FMA_DIV)
-
-
-@triton.jit
 def _stats_kernel(
     XM, W, BS, TAU, STATS,
     N, G, H,
@@ -290,7 +264,6 @@ def _stats_kernel(
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
     DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
-    FMA_DIV: tl.constexpr,
 ):
     """m[n] = max_g logit[n, g], l[n] = sum_g exp(logit[n, g] - m[n]), in one
     pass over G in FlashAttention's online form: l is rescaled by
@@ -316,8 +289,8 @@ def _stats_kernel(
     offs_n64 = offs_n.to(tl.int64)
     xm = _load_rows(XM, b, h, offs_n64, offs_d, nmask, dmask, sxb, sxn, sxh, sxd,
                     PAD_D)
-    tau = tl.load(TAU + h).to(tl.float32)
-    inv_tau = 1.0 / tau
+    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
+    xm_s = xm * inv_tau
 
     m = tl.full((BN,), float("-inf"), tl.float32)
     l = tl.zeros((BN,), tl.float32)
@@ -325,7 +298,7 @@ def _stats_kernel(
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        lg = _logits(xm, w_mat, bias, tau, inv_tau, DOT, FMA_DIV)
+        lg = _logits(xm, xm_s, w_mat, bias, inv_tau, DOT)
         if PAD_G:
             lg = tl.where(gmask[None, :], lg, float("-inf"))
         m_new = tl.maximum(m, tl.max(lg, axis=1))
@@ -348,14 +321,12 @@ def _stats_twopass_kernel(
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
     DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
-    FMA_DIV: tl.constexpr,
 ):
     """The statistics in two passes over G: the max first, then the sum of
     exponentials against the final max, so that l is the same sum every
-    consumer implicitly forms, to the precision of one summation. This was
-    the only form until the point-owning kernels started forming their own
-    row sums (see _stats_kernel); it costs one more logits pass and stays
-    available through ``set_stats_mode("two-pass")``."""
+    consumer implicitly forms, to the precision of one summation. The
+    original form; it costs one more logits pass and stays available through
+    ``set_stats_mode("two-pass")``."""
     pid = tl.program_id(0)
     bh = tl.program_id(1)
     b = bh // H
@@ -369,15 +340,15 @@ def _stats_twopass_kernel(
     offs_n64 = offs_n.to(tl.int64)
     xm = _load_rows(XM, b, h, offs_n64, offs_d, nmask, dmask, sxb, sxn, sxh, sxd,
                     PAD_D)
-    tau = tl.load(TAU + h).to(tl.float32)
-    inv_tau = 1.0 / tau
+    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
+    xm_s = xm * inv_tau
 
     m = tl.full((BN,), float("-inf"), tl.float32)
     for g0 in range(0, G, GB):
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        lg = _logits(xm, w_mat, bias, tau, inv_tau, DOT, FMA_DIV)
+        lg = _logits(xm, xm_s, w_mat, bias, inv_tau, DOT)
         if PAD_G:
             lg = tl.where(gmask[None, :], lg, float("-inf"))
         m = tl.maximum(m, tl.max(lg, axis=1))
@@ -386,7 +357,7 @@ def _stats_twopass_kernel(
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        e = _expw(_logits(xm, w_mat, bias, tau, inv_tau, DOT, FMA_DIV), m)
+        e = _expw(_logits(xm, xm_s, w_mat, bias, inv_tau, DOT), m)
         if PAD_G:
             e = tl.where(gmask[None, :], e, 0.0)
         l += tl.sum(e, axis=1)
@@ -405,10 +376,11 @@ def _slice_fwd_g_kernel(
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
     DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
-    FMA_DIV: tl.constexpr,
 ):
     """Owns one G-block, streams over N: z_num[g] = sum_n w[n,g] fx[n],
-    s[g] = sum_n w[n,g]. Per-program partials, reduced on the host."""
+    s[g] = sum_n w[n,g]. Per-program partials, reduced on the host. The row
+    normalizer 1/l scales the value rows, not the (BN, GB) tile that feeds
+    the transposed dot (see _logits)."""
     gblk = tl.program_id(0)
     pid = tl.program_id(1)
     bh = tl.program_id(2)
@@ -424,8 +396,7 @@ def _slice_fwd_g_kernel(
     offs_g = gblk * GB + tl.arange(0, GB)
     gmask = offs_g < G
     w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-    tau = tl.load(TAU + h).to(tl.float32)
-    inv_tau = 1.0 / tau
+    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
 
     acc_z = tl.zeros((GB, DVT), dtype=tl.float32)
     acc_s = tl.zeros((GB,), dtype=tl.float32)
@@ -436,15 +407,21 @@ def _slice_fwd_g_kernel(
         xm = _load_rows(XM, b, h, offs_n64, offs_d, nmask, dmask,
                         sxb, sxn, sxh, sxd, PAD_D)
         m, l = _load_stats(STATS, bh64, N, offs_n64)
-        w = _weights(_logits(xm, w_mat, bias, tau, inv_tau, DOT, FMA_DIV), m, l, 1.0 / l, DOT, FMA_DIV)
+        inv_l = _rcp(l)
+        e = _expw(_logits(xm, xm * inv_tau, w_mat, bias, inv_tau, DOT), m)
         if PAD_G:
-            w = tl.where(nmask[:, None] & gmask[None, :], w, 0.0)
+            e = tl.where(nmask[:, None] & gmask[None, :], e, 0.0)
         else:
-            w = tl.where(nmask[:, None], w, 0.0)
+            e = tl.where(nmask[:, None], e, 0.0)
         fx = _load_rows(FX, b, h, offs_n64, offs_v, nmask, vmask,
                         sfb, sfn, sfh, sfd, PAD_V)
-        acc_z += _dot(tl.trans(w), fx, DOT)
-        acc_s += tl.sum(w, axis=0)
+        if DOT >= 3:
+            w = e * inv_l[:, None]
+            acc_z += _dot(tl.trans(w), fx, DOT)
+            acc_s += tl.sum(w, axis=0)
+        else:
+            acc_z += _dot(tl.trans(e), fx * inv_l[:, None], DOT)
+            acc_s += tl.sum(e * inv_l[:, None], axis=0)
 
     idx = (bh * P + pid).to(tl.int64)
     _store_part(PART_Z, acc_z, idx, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
@@ -464,14 +441,10 @@ def _deslice_fwd_n_kernel(
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
     DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
-    FMA_DIV: tl.constexpr,
 ):
     """Owns one N-block, streams over G with the statistics in hand:
-    out[n] = sum_g w[n,g] z'[g], accumulated unnormalized and scaled once at
-    the end by 1/l. An output is a plain weighted sum, so the saved l serves
-    it (a row factor of 1 + O(ulp) is a relative perturbation, not a
-    cancellation); only the backward's Jacobian terms need the row sum formed
-    in place (see _slice_bwd_n_kernel)."""
+    out[n] = sum_g w[n,g] z'[g], accumulated unnormalized and scaled once by
+    1/l at the end."""
     pid = tl.program_id(0)
     bh = tl.program_id(1)
     b = bh // H
@@ -489,22 +462,21 @@ def _deslice_fwd_n_kernel(
     xm = _load_rows(XM, b, h, offs_n64, offs_d, nmask, dmask, sxb, sxn, sxh, sxd,
                     PAD_D)
     m, l = _load_stats(STATS, bh64, N, offs_n64)
-    inv_l = 1.0 / l
-    tau = tl.load(TAU + h).to(tl.float32)
-    inv_tau = 1.0 / tau
+    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
+    xm_s = xm * inv_tau
 
     acc = tl.zeros((BN, DVT), dtype=tl.float32)
     for g0 in range(0, G, GB):
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        e = _expw(_logits(xm, w_mat, bias, tau, inv_tau, DOT, FMA_DIV), m)
+        e = _expw(_logits(xm, xm_s, w_mat, bias, inv_tau, DOT), m)
         if PAD_G:
             e = tl.where(gmask[None, :], e, 0.0)
         tok = _load_tok(TOK, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
         acc += _dot(e, tok, DOT)
-    _store_rows(OUT, _over_rows(acc, l, inv_l, DOT, FMA_DIV), b, h, offs_n64, offs_v, nmask,
-                vmask, sob, son, soh, sod, PAD_V)
+    _store_rows(OUT, acc * _rcp(l)[:, None], b, h, offs_n64, offs_v, nmask, vmask,
+                sob, son, soh, sod, PAD_V)
 
 
 @triton.jit
@@ -517,7 +489,6 @@ def _deslice_fwd_online_kernel(
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
     DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
-    FMA_DIV: tl.constexpr,
 ):
     """Owns one N-block, streams over G with no statistics in hand:
     out[n] = sum_g w[n,g] z'[g] by online softmax (FlashAttention's forward:
@@ -542,8 +513,8 @@ def _deslice_fwd_online_kernel(
     offs_n64 = offs_n.to(tl.int64)
     xm = _load_rows(XM, b, h, offs_n64, offs_d, nmask, dmask, sxb, sxn, sxh, sxd,
                     PAD_D)
-    tau = tl.load(TAU + h).to(tl.float32)
-    inv_tau = 1.0 / tau
+    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
+    xm_s = xm * inv_tau
 
     m = tl.full((BN,), float("-inf"), tl.float32)
     l = tl.zeros((BN,), dtype=tl.float32)
@@ -552,7 +523,7 @@ def _deslice_fwd_online_kernel(
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        lg = _logits(xm, w_mat, bias, tau, inv_tau, DOT, FMA_DIV)
+        lg = _logits(xm, xm_s, w_mat, bias, inv_tau, DOT)
         if PAD_G:
             lg = tl.where(gmask[None, :], lg, float("-inf"))
         m_new = tl.maximum(m, tl.max(lg, axis=1))
@@ -564,9 +535,8 @@ def _deslice_fwd_online_kernel(
         tok = _load_tok(TOK, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
         acc = acc * alpha[:, None] + _dot(e, tok, DOT)
         m = m_new
-    inv_l = 1.0 / l
-    _store_rows(OUT, _over_rows(acc, l, inv_l, DOT, FMA_DIV), b, h, offs_n64, offs_v, nmask,
-                vmask, sob, son, soh, sod, PAD_V)
+    _store_rows(OUT, acc * _rcp(l)[:, None], b, h, offs_n64, offs_v, nmask, vmask,
+                sob, son, soh, sod, PAD_V)
     base = STATS + bh64 * 2 * N
     tl.store(base + offs_n64, m, mask=nmask)
     tl.store(base + N + offs_n64, l, mask=nmask)
@@ -583,11 +553,11 @@ def _slice_bwd_n_kernel(
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
     DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
-    FMA_DIV: tl.constexpr,
 ):
     """Owns one N-block. Pass 1 over G, unnormalized: dfx = e @ dz_num and the
     Jacobian numerator sum_g e dw, both divided by the row sum once at the
-    end. Pass 2: dxm, and the temperature gradient.
+    end. Pass 2: dxm, and the temperature gradient; the division by tau is
+    applied to the accumulators, once.
 
     delta = (sum_g e_g dw_g) / l and dl_g = (e_g dw_g - e_g delta) / l are
     built from the same rounded products e_g dw_g, so that sum_g dl vanishes
@@ -597,7 +567,9 @@ def _slice_bwd_n_kernel(
     delta = fx . dfx + w @ ds (one dot cheaper) put 3x eager's error on it at
     N=17, G=256; normalizing w first and forming delta from w dw while dl
     used w (dw - delta) put an independently rounded second product into the
-    identity, 1.5-1.9x. Every other gradient is indifferent to either.
+    identity, 1.5-1.9x; Triton's approximate division in place of the
+    correctly rounded reciprocal, 2-14x. Every other gradient is indifferent
+    to the first two and 2x worse under the third.
 
     dtau lives here and not in the G-owned kernel because it is
     sum_n sum_g dl * (-logit / tau) with sum_g dl = 0 on every row: the row
@@ -625,9 +597,9 @@ def _slice_bwd_n_kernel(
     fx = _load_rows(FX, b, h, offs_n64, offs_v, nmask, vmask, sfb, sfn, sfh, sfd,
                     PAD_V)
     m, l = _load_stats(STATS, bh64, N, offs_n64)
-    inv_l = 1.0 / l
-    tau = tl.load(TAU + h).to(tl.float32)
-    inv_tau = 1.0 / tau
+    inv_l = _rcp(l)
+    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
+    xm_s = xm * inv_tau
 
     acc_dfx = tl.zeros((BN, DVT), dtype=tl.float32)
     sdw = tl.zeros((BN,), dtype=tl.float32)
@@ -635,7 +607,7 @@ def _slice_bwd_n_kernel(
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        e = _expw(_logits(xm, w_mat, bias, tau, inv_tau, DOT, FMA_DIV), m)
+        e = _expw(_logits(xm, xm_s, w_mat, bias, inv_tau, DOT), m)
         if PAD_G:
             e = tl.where(gmask[None, :], e, 0.0)
         dzn = _load_tok(DZN, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
@@ -643,9 +615,9 @@ def _slice_bwd_n_kernel(
         acc_dfx += _dot(e, dzn, DOT)
         dw = _dot(fx, tl.trans(dzn), DOT) + ds[None, :]
         sdw += tl.sum(e * dw, axis=1)
-    delta = sdw / l
-    _store_rows(DFX, _over_rows(acc_dfx, l, inv_l, DOT, FMA_DIV), b, h, offs_n64, offs_v,
-                nmask, vmask, sfb, sfn, sfh, sfd, PAD_V)
+    delta = sdw * inv_l
+    _store_rows(DFX, acc_dfx * inv_l[:, None], b, h, offs_n64, offs_v, nmask, vmask,
+                sfb, sfn, sfh, sfd, PAD_V)
     tl.store(DELTA + bh64 * N + offs_n64, delta, mask=nmask)
 
     acc_dxm = tl.zeros((BN, DT), dtype=tl.float32)
@@ -654,20 +626,20 @@ def _slice_bwd_n_kernel(
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        lg = _logits(xm, w_mat, bias, tau, inv_tau, DOT, FMA_DIV)
+        lg = _logits(xm, xm_s, w_mat, bias, inv_tau, DOT)
         e = _expw(lg, m)
         if PAD_G:
             e = tl.where(gmask[None, :], e, 0.0)
         dzn = _load_tok(DZN, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
         ds = _load_vec(DS + bh64 * G, offs_g, G)
         dw = _dot(fx, tl.trans(dzn), DOT) + ds[None, :]
-        dl = _over_rows(e * dw - e * delta[:, None], l, inv_l, DOT, FMA_DIV)
-        acc_dxm += _dot(_over_tau(dl, tau, inv_tau, DOT, FMA_DIV), w_mat, DOT)
+        dl = (e * dw - e * delta[:, None]) * inv_l[:, None]
+        acc_dxm += _dot(dl, w_mat, DOT)
         row_dt += tl.sum(dl * lg, axis=1)
-    _store_rows(DXM, acc_dxm, b, h, offs_n64, offs_d, nmask, dmask,
+    _store_rows(DXM, acc_dxm * inv_tau, b, h, offs_n64, offs_d, nmask, dmask,
                 sxb, sxn, sxh, sxd, PAD_D)
     tl.store(PDT + bh64 * tl.num_programs(0) + pid,
-             -tl.sum(tl.where(nmask, row_dt, 0.0), axis=0) / tau)
+             -inv_tau * tl.sum(tl.where(nmask, row_dt, 0.0), axis=0))
 
 
 @triton.jit
@@ -681,9 +653,10 @@ def _slice_bwd_g_kernel(
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
     DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
-    FMA_DIV: tl.constexpr,
 ):
-    """Owns one G-block, streams over N: partial dW and db."""
+    """Owns one G-block, streams over N: partial dW and db. The per-point
+    factor 1 / (l tau) scales the x_mid rows that feed the transposed dot,
+    not the (BN, GB) tile (see _logits)."""
     gblk = tl.program_id(0)
     pid = tl.program_id(1)
     bh = tl.program_id(2)
@@ -699,8 +672,7 @@ def _slice_bwd_g_kernel(
     offs_g = gblk * GB + tl.arange(0, GB)
     gmask = offs_g < G
     w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-    tau = tl.load(TAU + h).to(tl.float32)
-    inv_tau = 1.0 / tau
+    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
     dzn = _load_tok(DZN, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
     ds = _load_vec(DS + bh64 * G, offs_g, G)
 
@@ -716,15 +688,21 @@ def _slice_bwd_g_kernel(
                         sfb, sfn, sfh, sfd, PAD_V)
         m, l = _load_stats(STATS, bh64, N, offs_n64)
         delta = _load_vec(DELTA + bh64 * N, offs_n64, N)
-        w = _weights(_logits(xm, w_mat, bias, tau, inv_tau, DOT, FMA_DIV), m, l, 1.0 / l, DOT, FMA_DIV)
+        e = _expw(_logits(xm, xm * inv_tau, w_mat, bias, inv_tau, DOT), m)
         if PAD_G:
-            w = tl.where(nmask[:, None] & gmask[None, :], w, 0.0)
+            e = tl.where(nmask[:, None] & gmask[None, :], e, 0.0)
         else:
-            w = tl.where(nmask[:, None], w, 0.0)
+            e = tl.where(nmask[:, None], e, 0.0)
         dw = _dot(fx, tl.trans(dzn), DOT) + ds[None, :]
-        dlr = _over_tau(w * (dw - delta[:, None]), tau, inv_tau, DOT, FMA_DIV)
-        acc_dw += _dot(tl.trans(dlr), xm, DOT)
-        acc_db += tl.sum(dlr, axis=0)
+        if DOT >= 3:
+            dlr = e * _rcp(l)[:, None] * (dw - delta[:, None]) * inv_tau
+            acc_dw += _dot(tl.trans(dlr), xm, DOT)
+            acc_db += tl.sum(dlr, axis=0)
+        else:
+            dl = e * (dw - delta[:, None])
+            s = _rcp(l) * inv_tau
+            acc_dw += _dot(tl.trans(dl), xm * s[:, None], DOT)
+            acc_db += tl.sum(dl * s[:, None], axis=0)
 
     idx = (bh * P + pid).to(tl.int64)
     _store_part(PDW, acc_dw, idx, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
@@ -745,7 +723,6 @@ def _deslice_bwd_n_kernel(
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
     DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
-    FMA_DIV: tl.constexpr,
 ):
     """Owns one N-block. Pass 1 over G: the Jacobian numerator
     sum_g e (dout . z'[g]), divided by the row sum once (delta is recomputed
@@ -771,21 +748,21 @@ def _deslice_bwd_n_kernel(
     dout = _load_rows(DOUT, b, h, offs_n64, offs_v, nmask, vmask, sob, son, soh,
                       sod, PAD_V)
     m, l = _load_stats(STATS, bh64, N, offs_n64)
-    inv_l = 1.0 / l
-    tau = tl.load(TAU + h).to(tl.float32)
-    inv_tau = 1.0 / tau
+    inv_l = _rcp(l)
+    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
+    xm_s = xm * inv_tau
 
     sdw = tl.zeros((BN,), dtype=tl.float32)
     for g0 in range(0, G, GB):
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        e = _expw(_logits(xm, w_mat, bias, tau, inv_tau, DOT, FMA_DIV), m)
+        e = _expw(_logits(xm, xm_s, w_mat, bias, inv_tau, DOT), m)
         if PAD_G:
             e = tl.where(gmask[None, :], e, 0.0)
         tok = _load_tok(TOK, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
         sdw += tl.sum(e * _dot(dout, tl.trans(tok), DOT), axis=1)
-    delta = sdw / l
+    delta = sdw * inv_l
     tl.store(DELTA + bh64 * N + offs_n64, delta, mask=nmask)
 
     acc_dxm = tl.zeros((BN, DT), dtype=tl.float32)
@@ -794,19 +771,19 @@ def _deslice_bwd_n_kernel(
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        lg = _logits(xm, w_mat, bias, tau, inv_tau, DOT, FMA_DIV)
+        lg = _logits(xm, xm_s, w_mat, bias, inv_tau, DOT)
         e = _expw(lg, m)
         if PAD_G:
             e = tl.where(gmask[None, :], e, 0.0)
         tok = _load_tok(TOK, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
         dw = _dot(dout, tl.trans(tok), DOT)
-        dl = _over_rows(e * dw - e * delta[:, None], l, inv_l, DOT, FMA_DIV)
-        acc_dxm += _dot(_over_tau(dl, tau, inv_tau, DOT, FMA_DIV), w_mat, DOT)
+        dl = (e * dw - e * delta[:, None]) * inv_l[:, None]
+        acc_dxm += _dot(dl, w_mat, DOT)
         row_dt += tl.sum(dl * lg, axis=1)
-    _store_rows(DXM, acc_dxm, b, h, offs_n64, offs_d, nmask, dmask,
+    _store_rows(DXM, acc_dxm * inv_tau, b, h, offs_n64, offs_d, nmask, dmask,
                 sxb, sxn, sxh, sxd, PAD_D)
     tl.store(PDT + bh64 * tl.num_programs(0) + pid,
-             -tl.sum(tl.where(nmask, row_dt, 0.0), axis=0) / tau)
+             -inv_tau * tl.sum(tl.where(nmask, row_dt, 0.0), axis=0))
 
 
 @triton.jit
@@ -820,9 +797,10 @@ def _deslice_bwd_g_kernel(
     D: tl.constexpr, DT: tl.constexpr, GB: tl.constexpr, BN: tl.constexpr,
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
     DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
-    FMA_DIV: tl.constexpr,
 ):
-    """Owns one G-block, streams over N: partial dz', dW and db."""
+    """Owns one G-block, streams over N: partial dz', dW and db. The
+    per-point factors scale the value and x_mid rows that feed the
+    transposed dots, not the (BN, GB) tiles (see _logits)."""
     gblk = tl.program_id(0)
     pid = tl.program_id(1)
     bh = tl.program_id(2)
@@ -838,8 +816,7 @@ def _deslice_bwd_g_kernel(
     offs_g = gblk * GB + tl.arange(0, GB)
     gmask = offs_g < G
     w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-    tau = tl.load(TAU + h).to(tl.float32)
-    inv_tau = 1.0 / tau
+    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
     tok = _load_tok(TOK, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
 
     acc_dtok = tl.zeros((GB, DVT), dtype=tl.float32)
@@ -855,16 +832,25 @@ def _deslice_bwd_g_kernel(
                           sob, son, soh, sod, PAD_V)
         m, l = _load_stats(STATS, bh64, N, offs_n64)
         delta = _load_vec(DELTA + bh64 * N, offs_n64, N)
-        w = _weights(_logits(xm, w_mat, bias, tau, inv_tau, DOT, FMA_DIV), m, l, 1.0 / l, DOT, FMA_DIV)
+        e = _expw(_logits(xm, xm * inv_tau, w_mat, bias, inv_tau, DOT), m)
         if PAD_G:
-            w = tl.where(nmask[:, None] & gmask[None, :], w, 0.0)
+            e = tl.where(nmask[:, None] & gmask[None, :], e, 0.0)
         else:
-            w = tl.where(nmask[:, None], w, 0.0)
-        acc_dtok += _dot(tl.trans(w), dout, DOT)
+            e = tl.where(nmask[:, None], e, 0.0)
+        inv_l = _rcp(l)
         dw = _dot(dout, tl.trans(tok), DOT)
-        dlr = _over_tau(w * (dw - delta[:, None]), tau, inv_tau, DOT, FMA_DIV)
-        acc_dw += _dot(tl.trans(dlr), xm, DOT)
-        acc_db += tl.sum(dlr, axis=0)
+        if DOT >= 3:
+            w = e * inv_l[:, None]
+            acc_dtok += _dot(tl.trans(w), dout, DOT)
+            dlr = w * (dw - delta[:, None]) * inv_tau
+            acc_dw += _dot(tl.trans(dlr), xm, DOT)
+            acc_db += tl.sum(dlr, axis=0)
+        else:
+            acc_dtok += _dot(tl.trans(e), dout * inv_l[:, None], DOT)
+            dl = e * (dw - delta[:, None])
+            s = inv_l * inv_tau
+            acc_dw += _dot(tl.trans(dl), xm * s[:, None], DOT)
+            acc_db += tl.sum(dl * s[:, None], axis=0)
 
     idx = (bh * P + pid).to(tl.int64)
     _store_part(PDTOK, acc_dtok, idx, offs_g, offs_v, gmask, vmask, G, DV,
@@ -896,6 +882,35 @@ def _deslice_bwd_g_kernel(
 #   (32, 32): job 3262609 (G=32; fp32 and bf16 sweeps).
 #   (64, 32): jobs 3262609 (G=256, fp32) and 3263142 (G=256, bf16).
 _CFG_BLK = {
+    # (64, 64, 32): D=56 -> 64 logits width, 32 value width, bf16 dots -- the
+    # anchor-keyed coupling of TANGO v2; job 3304527 (G=1024, N=262k, one
+    # dtype/dot). The wider G-block is what tiles() picks on tensor-core paths.
+    (64, 64, 32): {
+        "stats": {
+            (True, 3): (256, 8, 1),
+        },
+        "slice_fwd_g": {
+            (True, 3): (64, 4, 3),
+        },
+        "deslice_fwd_n": {
+            (True, 3): (128, 4, 2),
+        },
+        "deslice_fwd_online": {
+            (True, 3): (128, 4, 1),
+        },
+        "slice_bwd_n": {
+            (True, 3): (64, 4, 1),
+        },
+        "slice_bwd_g": {
+            (True, 3): (64, 4, 1),
+        },
+        "deslice_bwd_n": {
+            (True, 3): (64, 4, 2),
+        },
+        "deslice_bwd_g": {
+            (True, 3): (64, 4, 1),
+        },
+    },
     (32, 32): {
         "stats": {
             (False, 0): (256, 4, 1),
@@ -1073,7 +1088,7 @@ def _consts(D, G, dt, gb, bn, dot, warps, stages, dv=None):
     dvt = _pow2_at_least_16(dv)
     return dict(D=D, DT=dt, GB=gb, BN=bn, DOT=dot, PAD_G=(G % gb != 0),
                 PAD_D=(dt != D), DV=dv, DVT=dvt, PAD_V=(dvt != dv),
-                FMA_DIV=_FMA_DIV, num_warps=warps, num_stages=stages)
+                num_warps=warps, num_stages=stages)
 
 
 def _bh_dims(x_mid, weight):
@@ -1085,7 +1100,7 @@ def compute_stats(x_mid, weight, bias, tau, dot=0):
     """(B, H, 2, N) fp32 softmax statistics of the slice logits per point:
     [..., 0, :] the row max, [..., 1, :] the sum of exponentials."""
     B, N, H, D, G = _bh_dims(x_mid, weight)
-    dt, gb = tiles(D, G)
+    dt, gb = tiles(D, G, dot)
     bn, warps, stages = _launch_cfg("stats", x_mid, dot, gb, dt)
     stats = torch.empty(B, H, 2, N, device=x_mid.device, dtype=torch.float32)
     weight, bias, tau = weight.contiguous(), bias.contiguous(), tau.contiguous()
@@ -1106,7 +1121,7 @@ def _slice_blk_impl(x_mid, fx_mid, weight, bias, tau, stats, dot):
         stats = compute_stats(x_mid, weight, bias, tau, dot)
     else:
         stats = stats.contiguous()
-    dt, gb = tiles(D, G)
+    dt, gb = tiles(D, G, dot)
     ngb = triton.cdiv(G, gb)
     DV = fx_mid.shape[3]
     bn, warps, stages = _launch_cfg("slice_fwd_g", x_mid, dot, gb, dt,
@@ -1131,7 +1146,7 @@ def _slice_blk_bwd_impl(x_mid, fx_mid, weight, bias, tau, stats, dz_num, ds,
     stats = stats.contiguous()
     dz_num = dz_num.contiguous().float()
     ds = ds.contiguous().float()
-    dt, gb = tiles(D, G)
+    dt, gb = tiles(D, G, dot)
     ngb = triton.cdiv(G, gb)
     dxm = torch.empty_like(x_mid)
     dfx = torch.empty_like(fx_mid)
@@ -1163,7 +1178,7 @@ def _deslice_blk_impl(x_mid, weight, bias, tau, tokens, stats, dot):
     weight, bias, tau = weight.contiguous(), bias.contiguous(), tau.contiguous()
     wb = _wb_layout(weight, bias, B, H)
     tokens = tokens.contiguous()
-    dt, gb = tiles(D, G)
+    dt, gb = tiles(D, G, dot)
     DV = tokens.shape[3]
     dvt = _pow2_at_least_16(DV)
     out = torch.empty(B, N, H, DV, device=x_mid.device, dtype=x_mid.dtype)
@@ -1195,7 +1210,7 @@ def _deslice_blk_bwd_impl(x_mid, weight, bias, tau, tokens, stats, d_out, dot):
     tokens = tokens.contiguous()
     d_out = d_out.contiguous()
     stats = stats.contiguous()
-    dt, gb = tiles(D, G)
+    dt, gb = tiles(D, G, dot)
     ngb = triton.cdiv(G, gb)
     dxm = torch.empty_like(x_mid)
     delta = torch.empty(B, H, N, device=x_mid.device, dtype=torch.float32)
