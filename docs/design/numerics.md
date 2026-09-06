@@ -54,6 +54,11 @@ it was the only one that did. Three rules came out of it:
    independently rounded product into the identity and cost 1.5–1.9× eager on
    \(d\tau\); the algebraically equal \(f_n \cdot df_n + w_n \cdot ds\) (one
    dot cheaper) cost 3×.
+4. **The divisors are correctly rounded.** \(1/l_n\) and \(1/\tau\) are
+   `div_rn` reciprocals. Triton's `/` lowers to the approximate `div.full`,
+   whose error is systematic per divisor; with the same divisor in every
+   term of a row that is exactly the coherent deviation the identity cannot
+   absorb, and it cost 2–14× eager on \(d\tau\) and 2× on \(dx_{mid}\).
 
 And the temperature gradient itself is summed **row by row over all of
 \(G\)** before anything is added across rows, in the point-owning kernel.

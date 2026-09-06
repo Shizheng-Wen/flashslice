@@ -226,17 +226,17 @@ def _rcp(x):
 
 
 @triton.jit
-def _logits(xm, xm_s, w_mat, bias, inv_tau, DOT: tl.constexpr):
+def _logits(xm, w_mat, bias, tau, inv_tau, DOT: tl.constexpr):
     """(BN, GB) slice logits (x . W + b) / tau: bias before the temperature,
-    as eager. On the tensor-core paths the tile is scaled after the dot; on
-    the FMA paths the scaled x_mid ``xm_s`` (formed once per tile) and a
-    scaled bias go into the dot instead -- a broadcast multiply on the
-    (BN, GB) tile changed the layout Triton 3.0 gave it and cost the FMA dot
-    its vectorized operand, 3-60x (jobs 3304466, 3304526)."""
+    as eager. On the tensor-core paths the tile is scaled by the reciprocal;
+    on the FMA paths it is divided, as in the original kernels -- there a
+    broadcast multiply on the (BN, GB) tile changed the layout Triton 3.0
+    gave it and cost the FMA dot its vectorized operand, 3-60x (jobs
+    3304466, 3304526, 3304594)."""
     if DOT >= 3:
         return (_dot_w(xm, tl.trans(w_mat), DOT) + bias[None, :]) * inv_tau
     else:
-        return _dot_w(xm_s, tl.trans(w_mat), DOT) + (bias * inv_tau)[None, :]
+        return (_dot_w(xm, tl.trans(w_mat), DOT) + bias[None, :]) / tau
 
 
 @triton.jit
@@ -289,8 +289,8 @@ def _stats_kernel(
     offs_n64 = offs_n.to(tl.int64)
     xm = _load_rows(XM, b, h, offs_n64, offs_d, nmask, dmask, sxb, sxn, sxh, sxd,
                     PAD_D)
-    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
-    xm_s = xm * inv_tau
+    tau = tl.load(TAU + h).to(tl.float32)
+    inv_tau = _rcp(tau)
 
     m = tl.full((BN,), float("-inf"), tl.float32)
     l = tl.zeros((BN,), tl.float32)
@@ -298,7 +298,7 @@ def _stats_kernel(
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        lg = _logits(xm, xm_s, w_mat, bias, inv_tau, DOT)
+        lg = _logits(xm, w_mat, bias, tau, inv_tau, DOT)
         if PAD_G:
             lg = tl.where(gmask[None, :], lg, float("-inf"))
         m_new = tl.maximum(m, tl.max(lg, axis=1))
@@ -340,15 +340,15 @@ def _stats_twopass_kernel(
     offs_n64 = offs_n.to(tl.int64)
     xm = _load_rows(XM, b, h, offs_n64, offs_d, nmask, dmask, sxb, sxn, sxh, sxd,
                     PAD_D)
-    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
-    xm_s = xm * inv_tau
+    tau = tl.load(TAU + h).to(tl.float32)
+    inv_tau = _rcp(tau)
 
     m = tl.full((BN,), float("-inf"), tl.float32)
     for g0 in range(0, G, GB):
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        lg = _logits(xm, xm_s, w_mat, bias, inv_tau, DOT)
+        lg = _logits(xm, w_mat, bias, tau, inv_tau, DOT)
         if PAD_G:
             lg = tl.where(gmask[None, :], lg, float("-inf"))
         m = tl.maximum(m, tl.max(lg, axis=1))
@@ -357,7 +357,7 @@ def _stats_twopass_kernel(
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        e = _expw(_logits(xm, xm_s, w_mat, bias, inv_tau, DOT), m)
+        e = _expw(_logits(xm, w_mat, bias, tau, inv_tau, DOT), m)
         if PAD_G:
             e = tl.where(gmask[None, :], e, 0.0)
         l += tl.sum(e, axis=1)
@@ -378,9 +378,10 @@ def _slice_fwd_g_kernel(
     DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
 ):
     """Owns one G-block, streams over N: z_num[g] = sum_n w[n,g] fx[n],
-    s[g] = sum_n w[n,g]. Per-program partials, reduced on the host. The row
-    normalizer 1/l scales the value rows, not the (BN, GB) tile that feeds
-    the transposed dot (see _logits)."""
+    s[g] = sum_n w[n,g]. Per-program partials, reduced on the host. On the
+    FMA paths w is formed by dividing the tile, as in the original kernels
+    (a multiply by the reciprocal, or scaling the value rows instead, made
+    the transposed dot 6-60x slower there: jobs 3304466, 3304526, 3304594)."""
     gblk = tl.program_id(0)
     pid = tl.program_id(1)
     bh = tl.program_id(2)
@@ -396,7 +397,8 @@ def _slice_fwd_g_kernel(
     offs_g = gblk * GB + tl.arange(0, GB)
     gmask = offs_g < G
     w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
+    tau = tl.load(TAU + h).to(tl.float32)
+    inv_tau = _rcp(tau)
 
     acc_z = tl.zeros((GB, DVT), dtype=tl.float32)
     acc_s = tl.zeros((GB,), dtype=tl.float32)
@@ -408,7 +410,7 @@ def _slice_fwd_g_kernel(
                         sxb, sxn, sxh, sxd, PAD_D)
         m, l = _load_stats(STATS, bh64, N, offs_n64)
         inv_l = _rcp(l)
-        e = _expw(_logits(xm, xm * inv_tau, w_mat, bias, inv_tau, DOT), m)
+        e = _expw(_logits(xm, w_mat, bias, tau, inv_tau, DOT), m)
         if PAD_G:
             e = tl.where(nmask[:, None] & gmask[None, :], e, 0.0)
         else:
@@ -417,11 +419,10 @@ def _slice_fwd_g_kernel(
                         sfb, sfn, sfh, sfd, PAD_V)
         if DOT >= 3:
             w = e * inv_l[:, None]
-            acc_z += _dot(tl.trans(w), fx, DOT)
-            acc_s += tl.sum(w, axis=0)
         else:
-            acc_z += _dot(tl.trans(e), fx * inv_l[:, None], DOT)
-            acc_s += tl.sum(e * inv_l[:, None], axis=0)
+            w = e / l[:, None]
+        acc_z += _dot(tl.trans(w), fx, DOT)
+        acc_s += tl.sum(w, axis=0)
 
     idx = (bh * P + pid).to(tl.int64)
     _store_part(PART_Z, acc_z, idx, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
@@ -462,15 +463,15 @@ def _deslice_fwd_n_kernel(
     xm = _load_rows(XM, b, h, offs_n64, offs_d, nmask, dmask, sxb, sxn, sxh, sxd,
                     PAD_D)
     m, l = _load_stats(STATS, bh64, N, offs_n64)
-    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
-    xm_s = xm * inv_tau
+    tau = tl.load(TAU + h).to(tl.float32)
+    inv_tau = _rcp(tau)
 
     acc = tl.zeros((BN, DVT), dtype=tl.float32)
     for g0 in range(0, G, GB):
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        e = _expw(_logits(xm, xm_s, w_mat, bias, inv_tau, DOT), m)
+        e = _expw(_logits(xm, w_mat, bias, tau, inv_tau, DOT), m)
         if PAD_G:
             e = tl.where(gmask[None, :], e, 0.0)
         tok = _load_tok(TOK, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
@@ -513,8 +514,8 @@ def _deslice_fwd_online_kernel(
     offs_n64 = offs_n.to(tl.int64)
     xm = _load_rows(XM, b, h, offs_n64, offs_d, nmask, dmask, sxb, sxn, sxh, sxd,
                     PAD_D)
-    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
-    xm_s = xm * inv_tau
+    tau = tl.load(TAU + h).to(tl.float32)
+    inv_tau = _rcp(tau)
 
     m = tl.full((BN,), float("-inf"), tl.float32)
     l = tl.zeros((BN,), dtype=tl.float32)
@@ -523,7 +524,7 @@ def _deslice_fwd_online_kernel(
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        lg = _logits(xm, xm_s, w_mat, bias, inv_tau, DOT)
+        lg = _logits(xm, w_mat, bias, tau, inv_tau, DOT)
         if PAD_G:
             lg = tl.where(gmask[None, :], lg, float("-inf"))
         m_new = tl.maximum(m, tl.max(lg, axis=1))
@@ -598,8 +599,8 @@ def _slice_bwd_n_kernel(
                     PAD_V)
     m, l = _load_stats(STATS, bh64, N, offs_n64)
     inv_l = _rcp(l)
-    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
-    xm_s = xm * inv_tau
+    tau = tl.load(TAU + h).to(tl.float32)
+    inv_tau = _rcp(tau)
 
     acc_dfx = tl.zeros((BN, DVT), dtype=tl.float32)
     sdw = tl.zeros((BN,), dtype=tl.float32)
@@ -607,7 +608,7 @@ def _slice_bwd_n_kernel(
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        e = _expw(_logits(xm, xm_s, w_mat, bias, inv_tau, DOT), m)
+        e = _expw(_logits(xm, w_mat, bias, tau, inv_tau, DOT), m)
         if PAD_G:
             e = tl.where(gmask[None, :], e, 0.0)
         dzn = _load_tok(DZN, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
@@ -626,7 +627,7 @@ def _slice_bwd_n_kernel(
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        lg = _logits(xm, xm_s, w_mat, bias, inv_tau, DOT)
+        lg = _logits(xm, w_mat, bias, tau, inv_tau, DOT)
         e = _expw(lg, m)
         if PAD_G:
             e = tl.where(gmask[None, :], e, 0.0)
@@ -654,9 +655,8 @@ def _slice_bwd_g_kernel(
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
     DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
 ):
-    """Owns one G-block, streams over N: partial dW and db. The per-point
-    factor 1 / (l tau) scales the x_mid rows that feed the transposed dot,
-    not the (BN, GB) tile (see _logits)."""
+    """Owns one G-block, streams over N: partial dW and db (the FMA paths
+    divide the tile, see _slice_fwd_g_kernel)."""
     gblk = tl.program_id(0)
     pid = tl.program_id(1)
     bh = tl.program_id(2)
@@ -672,7 +672,8 @@ def _slice_bwd_g_kernel(
     offs_g = gblk * GB + tl.arange(0, GB)
     gmask = offs_g < G
     w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
+    tau = tl.load(TAU + h).to(tl.float32)
+    inv_tau = _rcp(tau)
     dzn = _load_tok(DZN, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
     ds = _load_vec(DS + bh64 * G, offs_g, G)
 
@@ -688,7 +689,7 @@ def _slice_bwd_g_kernel(
                         sfb, sfn, sfh, sfd, PAD_V)
         m, l = _load_stats(STATS, bh64, N, offs_n64)
         delta = _load_vec(DELTA + bh64 * N, offs_n64, N)
-        e = _expw(_logits(xm, xm * inv_tau, w_mat, bias, inv_tau, DOT), m)
+        e = _expw(_logits(xm, w_mat, bias, tau, inv_tau, DOT), m)
         if PAD_G:
             e = tl.where(nmask[:, None] & gmask[None, :], e, 0.0)
         else:
@@ -696,13 +697,10 @@ def _slice_bwd_g_kernel(
         dw = _dot(fx, tl.trans(dzn), DOT) + ds[None, :]
         if DOT >= 3:
             dlr = e * _rcp(l)[:, None] * (dw - delta[:, None]) * inv_tau
-            acc_dw += _dot(tl.trans(dlr), xm, DOT)
-            acc_db += tl.sum(dlr, axis=0)
         else:
-            dl = e * (dw - delta[:, None])
-            s = _rcp(l) * inv_tau
-            acc_dw += _dot(tl.trans(dl), xm * s[:, None], DOT)
-            acc_db += tl.sum(dl * s[:, None], axis=0)
+            dlr = e / l[:, None] * (dw - delta[:, None]) / tau
+        acc_dw += _dot(tl.trans(dlr), xm, DOT)
+        acc_db += tl.sum(dlr, axis=0)
 
     idx = (bh * P + pid).to(tl.int64)
     _store_part(PDW, acc_dw, idx, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
@@ -749,15 +747,15 @@ def _deslice_bwd_n_kernel(
                       sod, PAD_V)
     m, l = _load_stats(STATS, bh64, N, offs_n64)
     inv_l = _rcp(l)
-    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
-    xm_s = xm * inv_tau
+    tau = tl.load(TAU + h).to(tl.float32)
+    inv_tau = _rcp(tau)
 
     sdw = tl.zeros((BN,), dtype=tl.float32)
     for g0 in range(0, G, GB):
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        e = _expw(_logits(xm, xm_s, w_mat, bias, inv_tau, DOT), m)
+        e = _expw(_logits(xm, w_mat, bias, tau, inv_tau, DOT), m)
         if PAD_G:
             e = tl.where(gmask[None, :], e, 0.0)
         tok = _load_tok(TOK, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
@@ -771,7 +769,7 @@ def _deslice_bwd_n_kernel(
         offs_g = g0 + tl.arange(0, GB)
         gmask = offs_g < G
         w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-        lg = _logits(xm, xm_s, w_mat, bias, inv_tau, DOT)
+        lg = _logits(xm, w_mat, bias, tau, inv_tau, DOT)
         e = _expw(lg, m)
         if PAD_G:
             e = tl.where(gmask[None, :], e, 0.0)
@@ -798,9 +796,8 @@ def _deslice_bwd_g_kernel(
     DOT: tl.constexpr, PAD_G: tl.constexpr, PAD_D: tl.constexpr,
     DV: tl.constexpr, DVT: tl.constexpr, PAD_V: tl.constexpr,
 ):
-    """Owns one G-block, streams over N: partial dz', dW and db. The
-    per-point factors scale the value and x_mid rows that feed the
-    transposed dots, not the (BN, GB) tiles (see _logits)."""
+    """Owns one G-block, streams over N: partial dz', dW and db (the FMA
+    paths divide the tile, see _slice_fwd_g_kernel)."""
     gblk = tl.program_id(0)
     pid = tl.program_id(1)
     bh = tl.program_id(2)
@@ -816,7 +813,8 @@ def _deslice_bwd_g_kernel(
     offs_g = gblk * GB + tl.arange(0, GB)
     gmask = offs_g < G
     w_mat, bias = _load_wb(W, BS, offs_g, offs_d, gmask, dmask, G, D, PAD_G, PAD_D)
-    inv_tau = _rcp(tl.load(TAU + h).to(tl.float32))
+    tau = tl.load(TAU + h).to(tl.float32)
+    inv_tau = _rcp(tau)
     tok = _load_tok(TOK, bh64, offs_g, offs_v, gmask, vmask, G, DV, PAD_G, PAD_V)
 
     acc_dtok = tl.zeros((GB, DVT), dtype=tl.float32)
@@ -832,7 +830,7 @@ def _deslice_bwd_g_kernel(
                           sob, son, soh, sod, PAD_V)
         m, l = _load_stats(STATS, bh64, N, offs_n64)
         delta = _load_vec(DELTA + bh64 * N, offs_n64, N)
-        e = _expw(_logits(xm, xm * inv_tau, w_mat, bias, inv_tau, DOT), m)
+        e = _expw(_logits(xm, w_mat, bias, tau, inv_tau, DOT), m)
         if PAD_G:
             e = tl.where(nmask[:, None] & gmask[None, :], e, 0.0)
         else:
@@ -841,16 +839,13 @@ def _deslice_bwd_g_kernel(
         dw = _dot(dout, tl.trans(tok), DOT)
         if DOT >= 3:
             w = e * inv_l[:, None]
-            acc_dtok += _dot(tl.trans(w), dout, DOT)
             dlr = w * (dw - delta[:, None]) * inv_tau
-            acc_dw += _dot(tl.trans(dlr), xm, DOT)
-            acc_db += tl.sum(dlr, axis=0)
         else:
-            acc_dtok += _dot(tl.trans(e), dout * inv_l[:, None], DOT)
-            dl = e * (dw - delta[:, None])
-            s = inv_l * inv_tau
-            acc_dw += _dot(tl.trans(dl), xm * s[:, None], DOT)
-            acc_db += tl.sum(dl * s[:, None], axis=0)
+            w = e / l[:, None]
+            dlr = w * (dw - delta[:, None]) / tau
+        acc_dtok += _dot(tl.trans(w), dout, DOT)
+        acc_dw += _dot(tl.trans(dlr), xm, DOT)
+        acc_db += tl.sum(dlr, axis=0)
 
     idx = (bh * P + pid).to(tl.int64)
     _store_part(PDTOK, acc_dtok, idx, offs_g, offs_v, gmask, vmask, G, DV,
@@ -880,7 +875,10 @@ def _deslice_bwd_g_kernel(
 # _cfg_blk describes, and a missing (G_block, D_tile) borrows the single-tile
 # table for G = G_block through _FAMILY.
 #   (32, 32): job 3262609 (G=32; fp32 and bf16 sweeps).
-#   (64, 32): jobs 3262609 (G=256, fp32) and 3263142 (G=256, bf16).
+#   (64, 32): jobs 3262609 (G=256, fp32) and 3263142 (G=256, bf16); the bf16
+#             entries re-swept for the one-pass statistics and the online
+#             deslice in job 3304595 (kept where the old tile was within 5%).
+#   (64, 64, 32): job 3304527 (G=1024, D=56, DV=32, bf16).
 _CFG_BLK = {
     # (64, 64, 32): D=56 -> 64 logits width, 32 value width, bf16 dots -- the
     # anchor-keyed coupling of TANGO v2; job 3304527 (G=1024, N=262k, one
@@ -968,7 +966,7 @@ _CFG_BLK = {
             (False, 1): (128, 4, 1),
             (True, 0): (128, 4, 1),
             (True, 1): (128, 4, 1),
-            (True, 3): (128, 4, 3),
+            (True, 3): (128, 4, 2),
         },
         "slice_fwd_g": {
             (False, 0): (128, 8, 3),
@@ -984,12 +982,19 @@ _CFG_BLK = {
             (True, 1): (64, 4, 1),
             (True, 3): (128, 4, 2),
         },
+        "deslice_fwd_online": {
+            (False, 0): (128, 4, 3),
+            (False, 1): (128, 4, 1),
+            (True, 0): (256, 8, 3),
+            (True, 1): (128, 4, 1),
+            (True, 3): (256, 4, 1),
+        },
         "slice_bwd_n": {
             (False, 0): (64, 4, 2),
             (False, 1): (64, 4, 1),
             (True, 0): (64, 4, 2),
             (True, 1): (64, 4, 1),
-            (True, 3): (64, 4, 3),
+            (True, 3): (128, 4, 3),
         },
         "slice_bwd_g": {
             (False, 0): (128, 4, 1),
@@ -1003,7 +1008,7 @@ _CFG_BLK = {
             (False, 1): (64, 4, 1),
             (True, 0): (128, 8, 3),
             (True, 1): (64, 4, 1),
-            (True, 3): (64, 4, 2),
+            (True, 3): (128, 4, 1),
         },
         "deslice_bwd_g": {
             (False, 0): (64, 4, 1),

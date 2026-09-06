@@ -74,9 +74,11 @@ are trusted**: `bench/bench_kernels.py --family blocked` at the shape, then
 `bench/pick_tiles.py` to print the table entry
 ([Tests and benchmarks](../benchmarks.md#tile-sweeps)).
 
-The block size `GB` comes from `blocked.tiles(D, G)`: the largest of 16..64
-that keeps `GB * D_tile <= 2048`, capped by `G` rounded up. `set_block_g`
-overrides it.
+The block size `GB` comes from `blocked.tiles(D, G, dot)`: the largest of
+16..64 that keeps `GB * D_tile` within the budget of the dot path, 2048 on
+the FMA paths and 4096 on the tensor-core paths (at `D_tile = 64` a block of
+64 measured 1.5–2.2× faster than 32 on the kernels that stream over `G`,
+bf16, `G = 1024`), capped by `G` rounded up. `set_block_g` overrides it.
 
 ## Statistics modes
 

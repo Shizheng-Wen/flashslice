@@ -21,9 +21,13 @@ changed and is re-gated.
   in one pass; `fused_deslice(..., return_stats=True)` returns them and
   `fused_slice(..., stats=)` takes them, so a tied coupling pays for the
   membership once per op in either order.
-- **Reciprocals** instead of per-element divisions by `tau` and by the row
-  sum on the tensor-core dot paths (`bf16`, `tf32x3`); the FMA paths keep the
-  divisions, where the multiply's layout cost the FMA dot 3–60×.
+- **Correctly rounded reciprocals** (`div_rn`) for `1/tau` and `1/l` in
+  place of per-element divisions; on the FMA paths the factors are applied
+  to the operand rows and the accumulators rather than the logits tile,
+  whose broadcast multiply cost the FMA dot 6–60×.
+- **Wider G-block on tensor-core paths.** `tiles(D, G, dot)` allows
+  `GB * D_tile <= 4096` there (2048 on FMA paths); a swept
+  `(G_block=64, D_tile=64, DV_tile=32)` entry serves the anchor-coupling shape.
 - **Tile table** keys may carry the value width: `(G_block, D_tile, DV_tile)`.
 - **Bench**: `bench_kernels.py --dim-value --weight-shape --stages`, the new
   kernels; `pick_tiles.py` emits three-element keys; `bench/parity_ops.py`.

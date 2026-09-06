@@ -87,11 +87,17 @@ a tensor-core mode to pull ahead of eager ([Performance](../performance.md)).
 
 For one \((n, g)\) pair and head, a forward pass does one logits multiply-add
 chain of length \(D\), one exponential, one value multiply-add chain of length
-\(D_V\), and a handful of fp32 operations: the temperature, the shift by
-\(m_n\), the mask where the last block is padded. On the tensor-core dot
-paths the divisions by \(\tau\) and by the row sum are multiplies by
-reciprocals formed once per program or per row; on the FMA paths they stay
-divisions, because the multiply changed the layout Triton 3.0 gave the tile
-and cost the FMA dot its vectorized operand (3–60× slower). At
+\(D_V\), and a handful of fp32 operations: the shift by \(m_n\), the mask
+where the last block is padded, and the per-point factors \(1/\tau\) and
+\(1/l_n\). Those factors are correctly rounded reciprocals (`div_rn`): Triton's
+`/` is the approximate `div.full`, and with the same rounded divisor in every
+term of a row it put 2–14× eager's error on the temperature gradient. Where
+they are applied depends on the dot path. On the tensor-core paths they
+multiply the (BN, GB) tile. On the FMA paths a broadcast multiply on that
+tile changed the layout Triton 3.0 gave it and cost the FMA dot its
+vectorized operand, 6–60×; so there the temperature scales \(x_{mid}\) and
+the bias before the dot, the row normalizer scales the value or \(x_{mid}\)
+rows that feed the transposed dots, and the accumulators are scaled once at
+the end. At
 \(D + D_V \approx 90\) the exponential is the second cost after the dots, the
 same limit FlashAttention-3 meets at small head dimensions.
