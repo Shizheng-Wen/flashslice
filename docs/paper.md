@@ -5,14 +5,16 @@ is that the load-bearing structure of Transolver is the *coupling* —
 alternating full-resolution pointwise MLPs with the slice/deslice
 bottleneck — and not the self-attention among slice tokens.
 
-Best validation relative L¹ across eight benchmarks in fluid dynamics and
-industrial aerodynamics, up to 1.4×10⁸ mesh points. Three seeds for the first
-two columns, one seed otherwise; **bold** is the best per row.
+Best validation relative L¹ across nine benchmarks in fluid dynamics and
+industrial aerodynamics, up to 1.3×10⁸ mesh points. Three seeds for the first
+two columns, one seed otherwise; **bold** is the best per row. The SHIFT-Wing
+volume row is read at 140k steps, the budget every arm of that benchmark reached.
 
 | Dataset | Baseline | NoTokenAttn | MlpOnly | Untied | FrozenSlice | SliceOnce |
 | --- | --- | --- | --- | --- | --- | --- |
 | Taylor–Green | 0.0756 ±.0001 | **0.0745** ±.0001 | 0.0786 | 0.0755 | 0.0777 | 0.188 |
 | SHIFT-Wing surface | 0.0580 ±.0005 | 0.0579 ±.0005 | 0.139 | **0.0576** | 0.0577 | 0.155 |
+| SHIFT-Wing volume | **0.12708** ±.00068 | 0.12709 ±.00078 | 0.408 | 0.1280 | 0.1350 | 0.793 |
 | DrivAerNet++ surface | 0.193 ±.005 | **0.188** ±.002 | 0.294 | 0.190 | 0.192 | 0.435 |
 | DrivAerNet++ volume | 0.1625 ±.0003 | **0.159** ±.001 | 0.315 | 0.162 | 0.162 | 0.386 |
 | SHIFT-SUV surface | 0.15654 ±.00074 | 0.15738 ±.00003 | 0.252 | **0.15575** | 0.15923 | 0.449 |
@@ -20,7 +22,7 @@ two columns, one seed otherwise; **bold** is the best per row.
 | DrivAerML surface | 0.089 ±.001 | 0.096 ±.000 | 0.501 | **0.086** | 0.104 | 0.579 |
 | DrivAerML volume | 0.110 ±.005 | 0.112 ±.004 | 0.497 | **0.108** | 0.123 | 0.745 |
 
-- **`no_token_attention` costs nothing** — −2.6% to +1.8% on six benchmarks,
+- **`no_token_attention` costs nothing** — −2.6% to +1.8% on seven benchmarks,
   +3.8% and +7.9% on the other two. Replacing the content-dependent attention
   core with a constant learned matrix is free, and on several benchmarks it is
   the best variant.
