@@ -140,9 +140,180 @@ _CFG_BF16 = {
 }
 
 
+# The same tables for GPUs with less shared memory per block than Hopper,
+# swept on one RTX 4090 (sm_89, 99 KB opt-in shared memory, torch 2.8,
+# Triton 3.4) with bench_kernels.py over N = 262k and 1M, fp32 and bf16
+# inputs, ieee and bf16 dots; BLOCK_N in {64, 128, 256} ({32, 64, 128}
+# at G=128), warps in {4, 8}, stages in {1, 2, 3}. On that GPU several
+# Hopper entries do not compile (shared memory) and others spill: the
+# Hopper tile is up to 15x (slice_fwd) and 22x (deslice_bwd) slower than
+# these at G=64 in fp32.
+_CFG_ADA = {
+    16: {
+        ('slice_fwd', False): (128, 4, 2),
+        ('slice_fwd', True): (128, 4, 1),
+        ('deslice_fwd', False): (128, 8, 3),
+        ('deslice_fwd', True): (128, 4, 1),
+        ('slice_bwd', False): (128, 8, 1),
+        ('slice_bwd', True): (128, 4, 1),
+        ('deslice_bwd', False): (128, 4, 3),
+        ('deslice_bwd', True): (128, 4, 1),
+    },
+    32: {
+        ('slice_fwd', False): (128, 4, 1),
+        ('slice_fwd', True): (128, 4, 1),
+        ('deslice_fwd', False): (64, 8, 3),
+        ('deslice_fwd', True): (256, 4, 1),
+        ('slice_bwd', False): (64, 4, 2),
+        ('slice_bwd', True): (64, 4, 2),
+        ('deslice_bwd', False): (64, 8, 1),
+        ('deslice_bwd', True): (128, 4, 1),
+    },
+    64: {
+        ('slice_fwd', False): (64, 4, 2),
+        ('slice_fwd', True): (64, 4, 3),
+        ('deslice_fwd', False): (64, 4, 3),
+        ('deslice_fwd', True): (128, 4, 2),
+        ('slice_bwd', False): (128, 8, 1),
+        ('slice_bwd', True): (128, 8, 2),
+        ('deslice_bwd', False): (64, 4, 1),
+        ('deslice_bwd', True): (64, 4, 1),
+    },
+    128: {
+        ('slice_fwd', False): (128, 8, 1),
+        ('slice_fwd', True): (128, 8, 1),
+        ('deslice_fwd', False): (64, 4, 3),
+        ('deslice_fwd', True): (64, 4, 1),
+        ('slice_bwd', False): (64, 8, 1),
+        ('slice_bwd', True): (64, 8, 3),
+        ('deslice_bwd', False): (64, 8, 1),
+        ('deslice_bwd', True): (64, 8, 1),
+    },
+}
+
+_CFG_BF16_ADA = {
+    16: {
+        'slice_fwd': (64, 4, 2),
+        'deslice_fwd': (64, 8, 1),
+        'slice_bwd': (128, 4, 1),
+        'deslice_bwd': (128, 4, 1),
+    },
+    32: {
+        'slice_fwd': (256, 8, 1),
+        'deslice_fwd': (64, 8, 1),
+        'slice_bwd': (64, 4, 1),
+        'deslice_bwd': (64, 4, 3),
+    },
+    64: {
+        'slice_fwd': (64, 4, 2),
+        'deslice_fwd': (64, 4, 2),
+        'slice_bwd': (64, 4, 1),
+        'deslice_bwd': (64, 4, 3),
+    },
+    128: {
+        'slice_fwd': (64, 4, 1),
+        'deslice_fwd': (64, 4, 1),
+        'slice_bwd': (64, 4, 2),
+        'deslice_bwd': (64, 4, 2),
+    },
+}
+
+
+# Ada tiles for the tf32-class dot levels (tf32 = 1, tf32x3 = 4; bf16v takes
+# the tf32 entry), fp32 inputs, one stage (the tf32 pipeliner guard): same
+# sweep protocol, BLOCK_N in {32, 64, 128}.
+_CFG_TF32_ADA = {
+    16: {
+        ('slice_fwd', 1): (64, 4, 1),
+        ('slice_fwd', 4): (64, 4, 1),
+        ('deslice_fwd', 1): (64, 8, 1),
+        ('deslice_fwd', 4): (64, 8, 1),
+        ('slice_bwd', 1): (64, 4, 1),
+        ('slice_bwd', 4): (32, 4, 1),
+        ('deslice_bwd', 1): (64, 4, 1),
+        ('deslice_bwd', 4): (64, 4, 1),
+    },
+    32: {
+        ('slice_fwd', 1): (128, 4, 1),
+        ('slice_fwd', 4): (64, 4, 1),
+        ('deslice_fwd', 1): (128, 8, 1),
+        ('deslice_fwd', 4): (128, 8, 1),
+        ('slice_bwd', 1): (64, 4, 1),
+        ('slice_bwd', 4): (64, 4, 1),
+        ('deslice_bwd', 1): (64, 4, 1),
+        ('deslice_bwd', 4): (32, 4, 1),
+    },
+    64: {
+        ('slice_fwd', 1): (64, 4, 1),
+        ('slice_fwd', 4): (64, 4, 1),
+        ('deslice_fwd', 1): (64, 4, 1),
+        ('deslice_fwd', 4): (64, 4, 1),
+        ('slice_bwd', 1): (64, 4, 1),
+        ('slice_bwd', 4): (64, 4, 1),
+        ('deslice_bwd', 1): (32, 4, 1),
+        ('deslice_bwd', 4): (32, 4, 1),
+    },
+    128: {
+        ('slice_fwd', 1): (32, 4, 1),
+        ('slice_fwd', 4): (64, 4, 1),
+        ('deslice_fwd', 1): (128, 8, 1),
+        ('deslice_fwd', 4): (64, 4, 1),
+        ('deslice_bwd', 1): (32, 4, 1),
+    },
+}
+
+
+# Tile tables per GPU class. The tables above were swept on a GH200 (227 KB of
+# shared memory per block); several of their entries do not fit the ~99 KB of
+# an Ada GPU (RTX 4090), and others spill registers there. The "ada" tables
+# were swept on one RTX 4090 with the same bench_kernels.py protocol and the
+# same winner rule (lowest mean slowdown against the per-N best over N = 262k
+# and 1M); they are _CFG_ADA and _CFG_BF16_ADA above. The class is
+# chosen from the device's opt-in shared memory per block, so any GPU with
+# less than Hopper's (Ada, consumer Ampere, A100) gets tiles that fit.
+_TILE_TABLES = ("hopper", "ada")
+_TILE_TABLE = os.environ.get("FLASHSLICE_TILE_TABLE", "").lower() or "auto"
+_TILE_CLASS = {}          # device index -> "hopper" | "ada"
+_HOPPER_SMEM = 200 * 1024
+
+
+def set_tile_table(name):
+    """'auto' (default), 'hopper' or 'ada' -- overrides FLASHSLICE_TILE_TABLE.
+    'auto' picks by the device's shared memory per block; forcing a table is
+    for timing comparisons (a 'hopper' tile may not compile on a smaller
+    GPU)."""
+    global _TILE_TABLE
+    if name not in ("auto",) + _TILE_TABLES:
+        raise ValueError("tile table must be 'auto', 'hopper' or 'ada', got %r"
+                         % (name,))
+    _TILE_TABLE = name
+
+
+def tile_table(device=None):
+    """The tile-table class used for ``device`` (default: the current one)."""
+    if _TILE_TABLE != "auto":
+        return _TILE_TABLE
+    idx = torch.cuda.current_device() if device is None else torch.device(device).index
+    if idx is None:
+        idx = torch.cuda.current_device()
+    if idx not in _TILE_CLASS:
+        smem = torch.cuda.get_device_properties(idx).shared_memory_per_block_optin
+        _TILE_CLASS[idx] = "hopper" if smem >= _HOPPER_SMEM else "ada"
+    return _TILE_CLASS[idx]
+
+
 def _cfg(name, t, dot=0, g=32, d=32):
-    table = _CFG_BF16 if dot == 3 else _CFG
-    key = name if dot == 3 else (name, t.dtype != torch.float32)
+    if tile_table(t.device) == "ada" and dot in (1, 2, 4):
+        # tf32-class dots hold fp32 MMA operands: on Ada their own tiles,
+        # since the ieee tiles can exceed its shared memory (tf32x3 at G=128
+        # asked for 160 KB). bf16v (2) takes the tf32 entry, as on Hopper.
+        table, key = _CFG_TF32_ADA, (name, 4 if dot == 4 else 1)
+    elif tile_table(t.device) == "ada":
+        table = _CFG_BF16_ADA if dot == 3 else _CFG_ADA
+        key = name if dot == 3 else (name, t.dtype != torch.float32)
+    else:
+        table = _CFG_BF16 if dot == 3 else _CFG
+        key = name if dot == 3 else (name, t.dtype != torch.float32)
     # G=32 tiles are the fallback for any (G, tier) the sweep does not cover
     bn, warps, stages = table.get(g, {}).get(key) or table[32][key]
     if d != 32:
@@ -255,7 +426,7 @@ def _check_dims(d, g, dv=None):
         raise ValueError("fused_slice: " + why)
 
 
-def _use_blocked(d, g, dv=None):
+def _use_blocked(d, g, dv=None, dot=0, device=None):
     """Route a shape: False = the single-tile kernels here, True = blocked."""
     if _KERNEL_MODE == "blocked":
         return True
@@ -265,7 +436,12 @@ def _use_blocked(d, g, dv=None):
                              "slice_num=%d, value width %s (powers of two in "
                              "[16, 128], equal widths)" % (d, g, dv))
         return False
-    return not single_tile_dims(d, g, dv)
+    if not single_tile_dims(d, g, dv):
+        return True
+    # On Ada the single-tile deslice backward at G=128 under tf32x3 needs
+    # 128 KB of shared memory at the smallest tile (99 KB available); the
+    # blocked family serves that combination in G-blocks of 64.
+    return dot == 4 and g >= 128 and tile_table(device) == "ada"
 
 
 def _n_programs(n, bh, block_n):
@@ -811,7 +987,7 @@ def fused_slice(x_mid, fx_mid, weight, bias, tau, return_stats=False,
     D, DV = x_mid.shape[3], fx_mid.shape[3]
     _check_dims(D, G, DV)
     dot = _dot_mode(x_mid)
-    if _use_blocked(D, G, DV):
+    if _use_blocked(D, G, DV, dot, x_mid.device):
         z_num, s, st = torch.ops.flashslice.slice_blk(
             x_mid, fx_mid, weight, bias, tau, stats, dot)
         return (z_num, s, st.detach()) if return_stats else (z_num, s)
@@ -837,7 +1013,7 @@ def fused_deslice(x_mid, weight, bias, tau, tokens, stats=None,
     D, DV = x_mid.shape[3], tokens.shape[3]
     _check_dims(D, G, DV)
     dot = _dot_mode(x_mid)
-    if _use_blocked(D, G, DV):
+    if _use_blocked(D, G, DV, dot, x_mid.device):
         out, st = torch.ops.flashslice.deslice_blk(x_mid, weight, bias, tau,
                                                    tokens, stats, dot)
         return (out, st.detach()) if return_stats else out

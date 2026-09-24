@@ -174,6 +174,8 @@ def test_cfg_blk_prefers_value_width_entry():
     wins over the borrowed single-tile table."""
     from flashslice.kernels import blocked as fb
 
+    # table logic, not tuning: pin the Hopper table whatever the GPU
+    fb.set_tile_table("hopper")
     saved = dict(fb._CFG_BLK)
     try:
         fb._CFG_BLK[(32, 64)] = {"deslice_fwd_n": {(True, 3): (128, 4, 2)}}
@@ -186,6 +188,7 @@ def test_cfg_blk_prefers_value_width_entry():
     finally:
         fb._CFG_BLK.clear()
         fb._CFG_BLK.update(saved)
+        fb.set_tile_table("auto")
 
 
 def test_launch_cfg_per_kernel_block():
@@ -193,6 +196,8 @@ def test_launch_cfg_per_kernel_block():
     one keeps the family default."""
     from flashslice.kernels import blocked as fb
 
+    # table logic, not tuning: pin the Hopper table whatever the GPU
+    fb.set_tile_table("hopper")
     saved = dict(fb._CFG_BLK)
     t = torch.empty(1, 8, 4, 56, dtype=torch.bfloat16)
     try:
@@ -203,6 +208,7 @@ def test_launch_cfg_per_kernel_block():
     finally:
         fb._CFG_BLK.clear()
         fb._CFG_BLK.update(saved)
+        fb.set_tile_table("auto")
 
 
 def test_stats_mode_switch():
@@ -217,3 +223,26 @@ def test_stats_mode_switch():
     finally:
         fb.set_stats_mode("online")
     assert fb.stats_mode() == "online"
+
+
+def test_tile_table_selection():
+    """The table class follows shared memory per block; an override wins."""
+    from flashslice.kernels import set_tile_table, tile_table
+    from flashslice.kernels import slice_ops as fs
+
+    try:
+        set_tile_table("ada")
+        assert tile_table() == "ada"
+        set_tile_table("hopper")
+        assert tile_table() == "hopper"
+        with pytest.raises(ValueError):
+            set_tile_table("ampere")
+    finally:
+        set_tile_table("auto")
+    if torch.cuda.is_available():
+        smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
+        assert tile_table(0) == ("hopper" if smem >= fs._HOPPER_SMEM else "ada")
+    # every Ada single-tile entry must exist for each G the Hopper table has
+    assert set(fs._CFG_ADA) == set(fs._CFG) and set(fs._CFG_BF16_ADA) == set(fs._CFG_BF16)
+    for g in fs._CFG:
+        assert set(fs._CFG_ADA[g]) == set(fs._CFG[g])

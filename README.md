@@ -61,13 +61,15 @@ Requirements: Python ≥ 3.9, PyTorch ≥ 2.4, Triton ≥ 3.0 and an NVIDIA GPU.
 All measurements were taken with PyTorch 2.5 and Triton 3.0 on an NVIDIA
 GH200.
 
-> **Other GPUs.** Nothing in the kernels is Hopper-specific: the default
-> `ieee` dot mode needs no tensor cores, and the `tf32`/`bf16` modes need
-> Ampere or newer. The tile tables, however, were tuned on Hopper's 227 KB of
-> shared memory per block; some entries exceed the ~100 KB of Ada GPUs such
-> as the RTX 4090. This fails at compile time with a Triton resource error,
-> never silently; re-tune with `bench/bench_kernels.py` and
-> `bench/pick_tiles.py`. Memory use does not depend on the GPU.
+> **Supported GPUs.** Tile configurations are tuned per GPU class and
+> picked automatically from the device's shared memory per block: a Hopper
+> table (H100/GH200, swept on a GH200) and an Ada table (swept on an RTX 4090),
+> which also serves other GPUs with less shared memory, such as consumer
+> Ampere and the A100. `flashslice.kernels.tile_table()` reports the class in
+> use; `set_tile_table(...)` or `FLASHSLICE_TILE_TABLE` forces one. The
+> default `ieee` dot mode needs no tensor cores; `tf32`/`bf16` need Ampere or
+> newer. For a new GPU, re-tune with `bench/bench_kernels.py` and
+> `bench/pick_tiles.py`.
 
 ## Quick start
 
@@ -171,6 +173,29 @@ What changes most is how the layer scales:
 Sizing rule: fused memory scales with `B·N` and the number of layers, not with
 `G` — about 8 GB per million points per layer for a bf16 training step and
 2 GB per million for inference (`H=8`, `D=32`).
+
+**On an RTX 4090** (24 GB, torch 2.8, Triton 3.4, the Ada tile table), one
+layer (`H=8`, `D=32`), eager against FlashSlice in the same process:
+
+| | *G* | *N* | eager | FlashSlice | speedup | eager mem | FlashSlice mem | saved |
+| --- | ---: | ---: | ---: | ---: | ---: | ---: | ---: | ---: |
+| training, fp32 | 32 | 262k | 66.1 ms | 16.5 ms | **4.01×** | 2.5 GB | 2.0 GB | 21% |
+| training, bf16 | 32 | 1M | 115.7 ms | 38.9 ms | **2.97×** | 10.5 GB | 8.0 GB | 24% |
+| training, fp32 | 64 | 262k | 80.3 ms | 18.1 ms | **4.45×** | 4.3 GB | 2.0 GB | 53% |
+| training, bf16 | 256 | 262k | 135.0 ms | 15.1 ms | **8.96×** | 13.6 GB | 2.0 GB | 85% |
+| training, bf16 | 1024 | 262k | OOM | 34.2 ms | — | — | 2.1 GB | — |
+| inference, fp32 | 32 | 1M | 111.6 ms | 19.1 ms | **5.85×** | 5.0 GB | 4.0 GB | 20% |
+| inference, bf16 | 256 | 1M | 99.2 ms | 13.1 ms | **7.56×** | 17.0 GB | 2.1 GB | 88% |
+
+bf16 rows use `bf16` dots. The Hopper table does not transfer: several of its
+tiles exceed the 4090's 99 KB of shared memory, and among those that fit, the
+tuned table is up to 4.1× faster (G=64, fp32 training step: 18.1 against
+74.2 ms). Every case of `bench/parity_test.py` passes on this GPU. Two checks
+of `bench/parity_ops.py` do not: the temperature gradient of the blocked
+kernels with per-sample weights, slice-first order, lands at 2.8–3.4×
+eager's error against the 2× gate (relative error ~2×10⁻⁵), with either tile
+table, so it is a numerics difference of this GPU and Triton version rather
+than a tiling one.
 
 <details>
 <summary><b>Kernels as the coupling of another model</b></summary>

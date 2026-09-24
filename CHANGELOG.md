@@ -1,5 +1,18 @@
 # Changelog
 
+## Unreleased
+
+- **Tile tables per GPU class.** `tile_table()` picks the Hopper tables
+  (unchanged) on GPUs with Hopper's shared memory per block and new Ada
+  tables, swept on an RTX 4090, on smaller ones; `set_tile_table` /
+  `FLASHSLICE_TILE_TABLE` force one. The Ada set covers the single-tile
+  family (ieee, bf16 and tf32-class dots, G = 16-128) and the blocked family
+  ((32, 32), (64, 32) and (16, 256) keys). On the 4090 several Hopper tiles
+  did not compile (shared memory) and others were up to 4x slower at the
+  layer level.
+- On Ada, `tf32x3` at G >= 128 routes to the blocked family: the single-tile
+  deslice backward needs 128 KB of shared memory there at any tile size.
+
 ## v0.2.0 — 2026-09-06
 
 Extensions that came from using the kernels as the coupling of a point-cloud

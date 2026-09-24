@@ -77,8 +77,9 @@ import torch
 import triton
 import triton.language as tl
 
-from .slice_ops import (_cfg, _dot, _dot_w, _n_programs, _reduce_parts, _stages,
-                        _strides, _wb_layout)
+from .slice_ops import (set_tile_table, tile_table,  # noqa: F401
+                        _cfg, _dot, _dot_w, _n_programs, _reduce_parts,
+                        _stages, _strides, _wb_layout)
 
 _BLOCK_G = None  # None = choose from D; set_block_g overrides
 
@@ -1053,12 +1054,198 @@ _CFG_BLK = {
 }
 
 
-def _cfg_blk(kernel, is16, dot, gb, dt, dvt=None):
+# The same table for GPUs with less shared memory than Hopper (see
+# slice_ops.tile_table), from --family blocked sweeps on one RTX 4090
+# (torch 2.8, Triton 3.4) at N = 262k and 1M: G=32 -> (32, 32) and G=256 ->
+# (64, 32), fp32 inputs with ieee/tf32 dots and bf16 inputs with
+# ieee/tf32/bf16 dots; D=256, G=32 -> (16, 256) at N = 131k and 262k. A
+# missing key borrows the single-tile Ada table
+# through _cfg, as on Hopper.
+_CFG_BLK_ADA = {
+    (16, 256): {
+        'stats': {
+            (False, 0): (16, 4, 2),
+            (False, 1): (64, 8, 1),
+            (True, 0): (64, 4, 2),
+            (True, 1): (64, 4, 1),
+            (True, 3): (32, 4, 3),
+        },
+        'slice_fwd_g': {
+            (False, 0): (16, 4, 3),
+            (False, 1): (64, 4, 1),
+            (True, 0): (64, 8, 1),
+            (True, 1): (32, 4, 1),
+            (True, 3): (32, 4, 2),
+        },
+        'deslice_fwd_n': {
+            (False, 0): (16, 4, 1),
+            (False, 1): (16, 8, 1),
+            (True, 0): (32, 8, 3),
+            (True, 1): (64, 4, 1),
+            (True, 3): (32, 4, 3),
+        },
+        'deslice_fwd_online': {
+            (False, 0): (16, 4, 1),
+            (False, 1): (32, 4, 1),
+            (True, 0): (32, 4, 3),
+            (True, 1): (32, 4, 1),
+            (True, 3): (32, 4, 2),
+        },
+        'slice_bwd_n': {
+            (False, 0): (32, 8, 2),
+            (False, 1): (16, 4, 1),
+            (True, 0): (32, 8, 2),
+            (True, 1): (32, 4, 1),
+            (True, 3): (64, 4, 2),
+        },
+        'slice_bwd_g': {
+            (False, 0): (16, 4, 1),
+            (False, 1): (16, 4, 1),
+            (True, 0): (16, 4, 1),
+            (True, 1): (32, 4, 1),
+            (True, 3): (32, 4, 2),
+        },
+        'deslice_bwd_n': {
+            (False, 0): (32, 8, 2),
+            (False, 1): (32, 4, 1),
+            (True, 0): (32, 8, 2),
+            (True, 1): (32, 4, 1),
+            (True, 3): (32, 4, 1),
+        },
+        'deslice_bwd_g': {
+            (False, 0): (16, 4, 1),
+            (False, 1): (16, 4, 1),
+            (True, 0): (16, 4, 1),
+            (True, 1): (32, 4, 1),
+            (True, 3): (16, 4, 2),
+        },
+    },
+    (32, 32): {
+        'stats': {
+            (False, 0): (256, 4, 3),
+            (False, 1): (256, 4, 1),
+            (True, 0): (256, 4, 1),
+            (True, 1): (256, 4, 1),
+            (True, 3): (128, 4, 1),
+        },
+        'slice_fwd_g': {
+            (False, 0): (128, 4, 1),
+            (False, 1): (128, 4, 1),
+            (True, 0): (128, 4, 1),
+            (True, 1): (256, 4, 1),
+            (True, 3): (64, 4, 2),
+        },
+        'deslice_fwd_n': {
+            (False, 0): (128, 8, 1),
+            (False, 1): (64, 8, 1),
+            (True, 0): (128, 4, 3),
+            (True, 1): (256, 8, 1),
+            (True, 3): (64, 8, 3),
+        },
+        'deslice_fwd_online': {
+            (False, 0): (256, 4, 1),
+            (False, 1): (128, 4, 1),
+            (True, 0): (128, 4, 3),
+            (True, 1): (64, 4, 1),
+            (True, 3): (256, 4, 3),
+        },
+        'slice_bwd_n': {
+            (False, 0): (64, 4, 2),
+            (False, 1): (64, 4, 1),
+            (True, 0): (128, 4, 2),
+            (True, 1): (64, 4, 1),
+            (True, 3): (128, 4, 2),
+        },
+        'slice_bwd_g': {
+            (False, 0): (128, 4, 1),
+            (False, 1): (64, 4, 1),
+            (True, 0): (128, 4, 1),
+            (True, 1): (128, 4, 1),
+            (True, 3): (128, 4, 2),
+        },
+        'deslice_bwd_n': {
+            (False, 0): (128, 4, 3),
+            (False, 1): (64, 4, 1),
+            (True, 0): (128, 4, 3),
+            (True, 1): (128, 4, 1),
+            (True, 3): (128, 4, 3),
+        },
+        'deslice_bwd_g': {
+            (False, 0): (128, 4, 1),
+            (False, 1): (64, 4, 1),
+            (True, 0): (128, 4, 1),
+            (True, 1): (128, 4, 1),
+            (True, 3): (128, 4, 2),
+        },
+    },
+    (64, 32): {
+        'stats': {
+            (False, 0): (128, 4, 3),
+            (False, 1): (128, 4, 1),
+            (True, 0): (128, 4, 2),
+            (True, 1): (128, 4, 1),
+            (True, 3): (256, 4, 2),
+        },
+        'slice_fwd_g': {
+            (False, 0): (64, 4, 1),
+            (False, 1): (64, 4, 1),
+            (True, 0): (64, 4, 1),
+            (True, 1): (128, 4, 1),
+            (True, 3): (128, 4, 2),
+        },
+        'deslice_fwd_n': {
+            (False, 0): (64, 4, 2),
+            (False, 1): (128, 8, 1),
+            (True, 0): (64, 4, 1),
+            (True, 1): (64, 4, 1),
+            (True, 3): (256, 4, 1),
+        },
+        'deslice_fwd_online': {
+            (False, 0): (64, 4, 1),
+            (False, 1): (64, 4, 1),
+            (True, 0): (64, 4, 1),
+            (True, 1): (64, 4, 1),
+            (True, 3): (128, 4, 2),
+        },
+        'slice_bwd_n': {
+            (False, 0): (64, 4, 2),
+            (False, 1): (64, 4, 1),
+            (True, 0): (64, 4, 2),
+            (True, 1): (64, 4, 1),
+            (True, 3): (128, 4, 3),
+        },
+        'slice_bwd_g': {
+            (False, 0): (64, 4, 1),
+            (False, 1): (64, 4, 1),
+            (True, 0): (64, 4, 1),
+            (True, 1): (64, 4, 1),
+            (True, 3): (64, 4, 3),
+        },
+        'deslice_bwd_n': {
+            (False, 0): (64, 4, 2),
+            (False, 1): (64, 4, 1),
+            (True, 0): (128, 8, 3),
+            (True, 1): (64, 4, 1),
+            (True, 3): (128, 4, 2),
+        },
+        'deslice_bwd_g': {
+            (False, 0): (64, 4, 1),
+            (False, 1): (64, 4, 1),
+            (True, 0): (64, 4, 1),
+            (True, 1): (64, 4, 1),
+            (True, 3): (64, 4, 3),
+        },
+    },
+}
+
+
+def _cfg_blk(kernel, is16, dot, gb, dt, dvt=None, device=None):
     # (G_block, D_tile, DV_tile) first -- the value width sets the shape of
     # the value accumulators -- then (G_block, D_tile) for any value width.
+    table = _CFG_BLK_ADA if tile_table(device) == "ada" else _CFG_BLK
     entry = {}
     for key in ((gb, dt, dvt), (gb, dt)):
-        entry = _CFG_BLK.get(key, {}).get(kernel)
+        entry = table.get(key, {}).get(kernel)
         if entry:
             break
     entry = entry or {}
@@ -1103,7 +1290,7 @@ def _launch_cfg(kernel, t, dot, gb, dt, dvt=None):
     table is keyed by the family's default G-block ``gb``; an entry with a
     fourth element gives that kernel its own block (the slot-owning backward
     kernels prefer a smaller one than the kernels that stream over G)."""
-    cfg = _cfg_blk(kernel, t.dtype != torch.float32, dot, gb, dt, dvt)
+    cfg = _cfg_blk(kernel, t.dtype != torch.float32, dot, gb, dt, dvt, t.device)
     if cfg and len(cfg) == 4:
         bn, warps, stages, gb = cfg
     else:
