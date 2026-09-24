@@ -32,14 +32,12 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/Shizheng-Wen/flashslice"
-Documentation = "https://shizheng-wen.github.io/flashslice/"
 Repository = "https://github.com/Shizheng-Wen/flashslice"
-Changelog = "https://shizheng-wen.github.io/flashslice/changelog/"
+Changelog = "https://github.com/Shizheng-Wen/flashslice/blob/main/CHANGELOG.md"
 Issues = "https://github.com/Shizheng-Wen/flashslice/issues"
 
 [project.optional-dependencies]
 dev = ["pytest"]
-docs = ["mkdocs>=1.6", "mkdocs-material>=9.5", "pymdown-extensions>=10.8"]
 
 [tool.setuptools.packages.find]
 include = ["flashslice*"]

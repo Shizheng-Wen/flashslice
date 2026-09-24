@@ -3,9 +3,9 @@
 ## v0.2.0 — 2026-09-06
 
 Extensions that came from using the kernels as the coupling of a point-cloud
-model with sample-specific anchors (see [Performance](performance.md#a-coupling-with-sample-specific-slots)).
+model with sample-specific anchors (see the README, *A coupling with sample-specific slots*).
 The single-tile kernels' numerical path is untouched; the blocked family
-changed and is re-gated. What comes next is in the [roadmap](roadmap.md).
+changed and is re-gated. What comes next is in [ROADMAP.md](ROADMAP.md).
 
 - **Weight layouts.** `weight` may be `(G, D)`, `(H, G, D)` or `(B, H, G, D)`;
   `bias` `None`, `(G,)`, `(H, G)` or `(B, H, G)`. Read through strides, zero
@@ -32,9 +32,6 @@ changed and is re-gated. What comes next is in the [roadmap](roadmap.md).
 - **Tile table** keys may carry the value width: `(G_block, D_tile, DV_tile)`.
 - **Bench**: `bench_kernels.py --dim-value --weight-shape --stages`, the new
   kernels; `pick_tiles.py` emits three-element keys; `bench/parity_ops.py`.
-- **Docs.** Figures for the single-tile path, blocked deslice (online softmax
-  over \(G\)), blocked slice (stream \(N\) with saved \((m,l)\)), tensor
-  anatomy, weight layouts, and the dot-mode split.
 
 ## v0.1.0 — the paper's tree
 

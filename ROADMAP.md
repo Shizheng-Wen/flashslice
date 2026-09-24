@@ -25,8 +25,7 @@ point-cloud model (measured on that model: one training step 985 → 387 ms at
   rounding; the FMA paths' arithmetic settled by measurement.
 - Tile-table keys with the value width, per-kernel G-blocks, a 4096 block
   budget on tensor-core paths; the anchor-coupling shape swept.
-- `bench/parity_ops.py`, `bench/launch_probe.py`, DV-aware sweeps; the docs
-  site.
+- `bench/parity_ops.py`, `bench/launch_probe.py`, DV-aware sweeps.
 
 ## Next — v0.3
 
@@ -102,4 +101,4 @@ kernels are now half of a coupling round.
       publishing; the trusted publisher on pypi.org is a one-time setup).
 - [ ] A GPU-less CI job for the tests that do not need a GPU (dims contract,
       routing, eager fallback); the parity gate stays a job on a GPU.
-- [ ] Per-release performance tables in the docs, with the job ids.
+- [ ] Per-release performance tables in the README, with the job ids.
