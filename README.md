@@ -58,8 +58,9 @@ cd flashslice && pip install -e .
 ```
 
 Requirements: Python ≥ 3.9, PyTorch ≥ 2.4, Triton ≥ 3.0 and an NVIDIA GPU.
-All measurements were taken with PyTorch 2.5 and Triton 3.0 on an NVIDIA
-GH200.
+Measurements were taken on two GPUs: an NVIDIA GH200 with PyTorch 2.5 and
+Triton 3.0 (the paper's numbers), and an NVIDIA RTX 4090 with PyTorch 2.8
+and Triton 3.4.
 
 > **Supported GPUs.** Tile configurations are tuned per GPU class and
 > picked automatically from the device's shared memory per block: a Hopper
