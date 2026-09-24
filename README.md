@@ -5,7 +5,9 @@
 **Fused Triton kernels for the slice/deslice coupling of physics-attention,
 and the Transolver layer they accelerate.**
 
-<!-- TODO: replace the two placeholder badges once the paper and the package are public -->
+<!-- TODO at public release: replace the arXiv and PyPI placeholder badges, and switch the
+     figure paths from assets/... to https://raw.githubusercontent.com/Shizheng-Wen/flashslice/main/assets/...
+     so that they also render on PyPI (relative paths work on GitHub only). -->
 [![arXiv](https://img.shields.io/badge/arXiv-coming%20soon-b31b1b.svg)](#citation)
 [![PyPI](https://img.shields.io/badge/PyPI-coming%20soon-3775a9.svg)](#installation)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/Shizheng-Wen/flashslice/blob/main/LICENSE)
@@ -115,7 +117,7 @@ shape, and `b` follows likewise. `DV` may differ from `D`.
 
 ## How it works
 
-![The kernel as tensor blocks, and peak memory against slice count and depth](https://raw.githubusercontent.com/Shizheng-Wen/flashslice/main/assets/F4_systems.png)
+![The kernel as tensor blocks, and peak memory against slice count and depth](assets/F4_systems.png)
 
 The eager layer materializes the slice weights `w` of shape `(B, H, N, G)` and
 keeps them for the backward pass; for `N` in the millions this is the largest
@@ -245,7 +247,7 @@ at a time.
 and `slice_once`, which need the slice weights the kernels never materialize;
 those combinations raise at construction.
 
-![The Transolver layer, the ablation ratios across nine benchmarks, and one render per benchmark family](https://raw.githubusercontent.com/Shizheng-Wen/flashslice/main/assets/F1_money.png)
+![The Transolver layer, the ablation ratios across nine benchmarks, and one render per benchmark family](assets/F1_money.png)
 
 Best validation relative L¹ on nine benchmarks in fluid dynamics and
 industrial aerodynamics, with up to 1.3×10⁸ mesh points per sample.
@@ -274,7 +276,7 @@ seed; **bold** marks the best per row.
   parameters than the baseline, but collapses the points into token space
   after one slice; it is the worst variant everywhere, at 2.2–6.8×.
 
-![Four controls: attention × tying, slice count, capacity, and the per-field cost of removing the coupling](https://raw.githubusercontent.com/Shizheng-Wen/flashslice/main/assets/F5_controls.png)
+![Four controls: attention × tying, slice count, capacity, and the per-field cost of removing the coupling](assets/F5_controls.png)
 
 The controls behind these readings: (a) whether the projections are tied or
 untied does not interact with removing the attention; (b) NoTokenAttn stays
