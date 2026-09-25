@@ -278,17 +278,18 @@ those combinations raise at construction.
 Best validation relative L¹ on nine benchmarks in fluid dynamics and
 industrial aerodynamics, with up to 1.3×10⁸ mesh points per sample.
 Baseline and NoTokenAttn are mean ± std over three seeds, the others one
-seed; **bold** marks the best per row.
+seed; **bold** marks the best per row. Three significant figures, standard
+deviations to one.
 
 | benchmark | Baseline | NoTokenAttn | MlpOnly | Untied | FrozenSlice | SliceOnce |
 | --- | ---: | ---: | ---: | ---: | ---: | ---: |
 | Taylor–Green | 0.0756 ±.0001 | **0.0745** ±.0001 | 0.0786 | 0.0755 | 0.0777 | 0.188 |
 | SHIFT-Wing surface | 0.0580 ±.0005 | 0.0579 ±.0005 | 0.139 | **0.0576** | 0.0577 | 0.155 |
-| SHIFT-Wing volume | **0.12708** ±.00068 | 0.12709 ±.00078 | 0.408 | 0.1280 | 0.1350 | 0.793 |
+| SHIFT-Wing volume | **0.127** ±.0007 | **0.127** ±.0008 | 0.408 | 0.128 | 0.135 | 0.793 |
 | DrivAerNet++ surface | 0.193 ±.005 | **0.188** ±.002 | 0.294 | 0.190 | 0.192 | 0.435 |
-| DrivAerNet++ volume | 0.1625 ±.0003 | **0.159** ±.001 | 0.315 | 0.162 | 0.162 | 0.386 |
-| SHIFT-SUV surface | 0.15654 ±.00074 | 0.15738 ±.00003 | 0.252 | **0.15575** | 0.15923 | 0.449 |
-| SHIFT-SUV volume | 0.06010 ±.00056 | 0.06238 ±.00086 | 0.197 | **0.05773** | 0.06834 | 0.408 |
+| DrivAerNet++ volume | 0.163 ±.0003 | **0.159** ±.001 | 0.315 | 0.162 | 0.162 | 0.386 |
+| SHIFT-SUV surface | 0.157 ±.0007 | 0.157 ±.00003 | 0.252 | **0.156** | 0.159 | 0.449 |
+| SHIFT-SUV volume | 0.0601 ±.0006 | 0.0624 ±.0009 | 0.197 | **0.0577** | 0.0683 | 0.408 |
 | DrivAerML surface | 0.089 ±.001 | 0.096 ±.000 | 0.501 | **0.086** | 0.104 | 0.579 |
 | DrivAerML volume | 0.110 ±.005 | 0.112 ±.004 | 0.497 | **0.108** | 0.123 | 0.745 |
 
