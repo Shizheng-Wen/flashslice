@@ -295,7 +295,8 @@ deviations to one.
 
 - **Token attention is removable.** NoTokenAttn is within −2.6% to +1.8% of
   the baseline on seven benchmarks and at +3.8% and +7.9% on the other two,
-  and it is the best variant on three.
+  and it is the best variant on four (tied with the baseline on SHIFT-Wing
+  volume).
 - **The coupling is not.** Removing it (MlpOnly) costs 1.04–5.6×, and
   widening the pointwise model to 112% of the baseline's parameters closes
   almost none of that gap.
