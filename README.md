@@ -5,11 +5,8 @@
 **Fused Triton kernels for the slice/deslice coupling of physics-attention,
 and the Transolver layer they accelerate.**
 
-<!-- TODO at public release: replace the arXiv and PyPI placeholder badges, and switch the
-     figure paths from assets/... to https://raw.githubusercontent.com/Shizheng-Wen/flashslice/main/assets/...
-     so that they also render on PyPI (relative paths work on GitHub only). -->
-[![arXiv](https://img.shields.io/badge/arXiv-coming%20soon-b31b1b.svg)](#citation)
-[![PyPI](https://img.shields.io/badge/PyPI-coming%20soon-3775a9.svg)](#installation)
+[![arXiv](https://img.shields.io/badge/arXiv-2609.32525-b31b1b.svg)](https://arxiv.org/abs/2609.32525)
+[![PyPI](https://img.shields.io/pypi/v/flashslice.svg?color=3775a9)](https://pypi.org/project/flashslice/)
 [![License](https://img.shields.io/badge/license-Apache%202.0-blue.svg)](https://github.com/Shizheng-Wen/flashslice/blob/main/LICENSE)
 [![Python](https://img.shields.io/badge/python-%E2%89%A53.9-blue.svg)](https://github.com/Shizheng-Wen/flashslice/blob/main/pyproject.toml)
 [![PyTorch](https://img.shields.io/badge/PyTorch-%E2%89%A52.4-ee4c2c.svg)](https://pytorch.org)
@@ -17,11 +14,12 @@ and the Transolver layer they accelerate.**
 
 </div>
 
-FlashSlice is the companion code of **“Does Transolver really need a
-Transformer?”**. The paper finds that Transolver's accuracy comes from the
-slice/deslice coupling between a full-resolution point stream and a small set
-of physics tokens, not from the self-attention among those tokens. This
-repository provides the two things needed to use that result:
+FlashSlice is the companion code of **[“Does Transolver really need a
+Transformer?”](https://arxiv.org/abs/2609.32525)** (Wen & Mishra, 2026). The
+paper finds that Transolver's accuracy comes from the slice/deslice coupling
+between a full-resolution point stream and a small set of physics tokens, not
+from the self-attention among those tokens. This repository provides the two
+things needed to use that result:
 
 - **Kernels** that compute slice and deslice as two streaming passes over the
   points, without ever writing the `N × H × G` slice-weight tensor to memory.
@@ -51,7 +49,7 @@ system, so the model and the kernels drop into an existing codebase.
 ## Installation
 
 ```bash
-pip install flashslice                 # once released on PyPI
+pip install flashslice
 # or, from source
 git clone https://github.com/Shizheng-Wen/flashslice.git
 cd flashslice && pip install -e .
@@ -120,7 +118,7 @@ shape, and `b` follows likewise. `DV` may differ from `D`.
 
 ## How it works
 
-![The kernel as tensor blocks, and peak memory against slice count and depth](assets/F4_systems.png)
+![The kernel as tensor blocks, and peak memory against slice count and depth](https://github.com/Shizheng-Wen/flashslice/raw/main/assets/F4_systems.png)
 
 The eager layer materializes the slice weights `w` of shape `(B, H, N, G)` and
 keeps them for the backward pass; for `N` in the millions this is the largest
@@ -273,7 +271,7 @@ at a time.
 and `slice_once`, which need the slice weights the kernels never materialize;
 those combinations raise at construction.
 
-![The Transolver layer, the ablation ratios across nine benchmarks, and one render per benchmark family](assets/F1_money.png)
+![The Transolver layer, the ablation ratios across nine benchmarks, and one render per benchmark family](https://github.com/Shizheng-Wen/flashslice/raw/main/assets/F1_money.png)
 
 Best validation relative L¹ on nine benchmarks in fluid dynamics and
 industrial aerodynamics, with up to 1.3×10⁸ mesh points per sample.
@@ -304,7 +302,7 @@ deviations to one.
   parameters than the baseline, but collapses the points into token space
   after one slice; it is the worst variant everywhere, at 2.2–6.8×.
 
-![Four controls: attention × tying, slice count, capacity, and the per-field cost of removing the coupling](assets/F5_controls.png)
+![Four controls: attention × tying, slice count, capacity, and the per-field cost of removing the coupling](https://github.com/Shizheng-Wen/flashslice/raw/main/assets/F5_controls.png)
 
 The controls behind these readings: (a) whether the projections are tied or
 untied does not interact with removing the attention; (b) NoTokenAttn stays
@@ -335,12 +333,12 @@ were measured on; [CHANGELOG.md](https://github.com/Shizheng-Wen/flashslice/blob
 If you use FlashSlice or build on its findings, please cite:
 
 ```bibtex
-@inproceedings{flashslice2027,
-  title     = {Does Transolver really need a Transformer?},
-  author    = {TBA},
-  booktitle = {Under review},
-  year      = {2027},
-  note      = {arXiv link to follow}
+@article{wen2026transolver,
+  title   = {Does Transolver really need a Transformer?},
+  author  = {Wen, Shizheng and Mishra, Siddhartha},
+  journal = {arXiv preprint arXiv:2609.32525},
+  year    = {2026},
+  url     = {https://arxiv.org/abs/2609.32525}
 }
 ```
 

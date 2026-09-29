@@ -1,0 +1,39 @@
+cff-version: 1.2.0
+message: "If you use FlashSlice or build on its findings, please cite the paper below."
+title: "FlashSlice"
+abstract: "Fused Triton kernels for the slice/deslice coupling of physics-attention, and the Transolver layer they accelerate."
+type: software
+authors:
+  - family-names: Wen
+    given-names: Shizheng
+    email: shizheng.wen@sam.math.ethz.ch
+    affiliation: "Seminar for Applied Mathematics, ETH Zurich"
+  - family-names: Mishra
+    given-names: Siddhartha
+    email: siddhartha.mishra@sam.math.ethz.ch
+    affiliation: "Seminar for Applied Mathematics, ETH Zurich"
+version: 0.3.0
+date-released: 2026-09-29
+license: Apache-2.0
+repository-code: "https://github.com/Shizheng-Wen/flashslice"
+url: "https://pypi.org/project/flashslice/"
+keywords:
+  - triton
+  - physics-attention
+  - transolver
+  - neural-operator
+preferred-citation:
+  type: article
+  title: "Does Transolver really need a Transformer?"
+  authors:
+    - family-names: Wen
+      given-names: Shizheng
+    - family-names: Mishra
+      given-names: Siddhartha
+  journal: "arXiv preprint arXiv:2609.32525"
+  year: 2026
+  url: "https://arxiv.org/abs/2609.32525"
+  identifiers:
+    - type: other
+      value: "arXiv:2609.32525"
+      description: "arXiv identifier"

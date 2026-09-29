@@ -1,10 +1,10 @@
 [build-system]
-requires = ["setuptools>=61"]
+requires = ["setuptools>=77"]  # SPDX license string (PEP 639)
 build-backend = "setuptools.build_meta"
 
 [project]
 name = "flashslice"
-version = "0.2.0"
+version = "0.3.0"
 description = "Fused Triton kernels for the slice/deslice bottleneck of physics-attention, and the Transolver layer they accelerate."
 readme = "README.md"
 license = "Apache-2.0"
@@ -32,6 +32,7 @@ dependencies = [
 
 [project.urls]
 Homepage = "https://github.com/Shizheng-Wen/flashslice"
+Paper = "https://arxiv.org/abs/2609.32525"
 Repository = "https://github.com/Shizheng-Wen/flashslice"
 Changelog = "https://github.com/Shizheng-Wen/flashslice/blob/main/CHANGELOG.md"
 Issues = "https://github.com/Shizheng-Wen/flashslice/issues"

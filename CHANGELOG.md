@@ -1,6 +1,9 @@
 # Changelog
 
-## Unreleased
+## v0.3.0 — 2026-09-29
+
+First full release on PyPI (0.0.1 was a placeholder), with the paper on
+arXiv: [2609.32525](https://arxiv.org/abs/2609.32525).
 
 - **Tile tables per GPU class.** `tile_table()` picks the Hopper tables
   (unchanged) on GPUs with Hopper's shared memory per block and new Ada
@@ -12,6 +15,8 @@
   layer level.
 - On Ada, `tf32x3` at G >= 128 routes to the blocked family: the single-tile
   deslice backward needs 128 KB of shared memory there at any tile size.
+- The docs site is gone; the README is self-contained and is also the PyPI
+  project description. `CITATION.cff` and the README carry the arXiv citation.
 
 ## v0.2.0 — 2026-09-06
 
