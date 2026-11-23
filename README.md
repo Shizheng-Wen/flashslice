@@ -236,9 +236,9 @@ Triton 3.6 put the `G=32` fp32 layer at 0.54× of eager, and the 3.6 tiles
 under Triton 3.0 at 1.00×. Every case of `bench/parity_test.py` passes under
 both. One check of `bench/parity_ops.py` does not pass under torch 2.11: the
 temperature gradient of the blocked kernels at `G=2048` lands at 2.1× eager's
-error against the 2× gate. The fused error is the same under both stacks
-(5.7×10⁻⁵); eager's own is smaller under torch 2.11 (2.7×10⁻⁵ against
-3.6×10⁻⁵).
+error against the 2× gate. The fused error is nearly the same under both
+stacks (5.7×10⁻⁵ and 5.8×10⁻⁵); eager's own is smaller under torch 2.11
+(2.7×10⁻⁵ against 3.6×10⁻⁵).
 
 <details>
 <summary><b>Kernels as the coupling of another model</b></summary>
