@@ -1,7 +1,10 @@
 # Benchmarks
 
 Reproduce the paper's systems numbers. Both scripts need a GPU; they were run on
-one NVIDIA GH200 (95 GB usable HBM) under torch 2.5 / Triton 3.0.
+one NVIDIA GH200 (95 GB usable HBM) under torch 2.5 / Triton 3.0. The Hopper
+tile tables have a second set for Triton 3.6 (torch 2.11); for another Triton,
+sweep again and check the result at the layer (`bench_layer.py`, and
+`replay_tiles.py` where the layer is slower than the kernels' sum).
 
 ## Correctness first
 

@@ -77,8 +77,8 @@ import torch
 import triton
 import triton.language as tl
 
-from .slice_ops import (set_tile_table, tile_table,  # noqa: F401
-                        _cfg, _dot, _dot_w, _n_programs, _reduce_parts,
+from .slice_ops import (set_tile_series, set_tile_table, tile_series,  # noqa: F401
+                        tile_table, _hopper_series, _cfg, _dot, _dot_w, _n_programs, _reduce_parts,
                         _stages, _strides, _wb_layout)
 
 _BLOCK_G = None  # None = choose from D; set_block_g overrides
@@ -1239,10 +1239,175 @@ _CFG_BLK_ADA = {
 }
 
 
+# Hopper under Triton 3.6 (see slice_ops.tile_series), swept 2026-11-23 with
+# bench_kernels.py --family blocked at N=262k and picked like the tables
+# above, among the configurations the launch code lets through (tensor-core
+# dots: one stage for tf32, 4 warps on the backward and the online kernels).
+#   (32, 32): jobs 4012026 / 4012028 (G=32, fp32 and bf16).
+#   (64, 32): jobs 4012030 / 4012032 (G=256, fp32 and bf16).
+#   (64, 64, 32): job 4012034 (G=1024, D=56, DV=32, bf16). Under this Triton
+#             the slot-owning backward kernels are faster on the family's
+#             block of 64 than on their own block of 32 (4.9 / 5.2 ms against
+#             7.4 / 8.0, job 4012036), so no entry carries a fourth element.
+# One entry is not the sweep's winner: (64, 32) deslice_bwd_n on 16-bit inputs
+# at the ieee level. bench_kernels.py hands that kernel fp32 tokens, the layer
+# under bf16 autocast hands it bf16 tokens, and Triton compiles the two apart:
+# the sweep's (256, 8, 3) took 42 ms inside a training step at N=262k against
+# 10 ms in the sweep. (64, 4, 2) is the winner of the layer's own call replayed
+# at every tile (job 4012942: the backward call 21.4 ms against 50.3).
+_CFG_BLK_T36 = {
+    (32, 32): {
+        "stats": {
+            (False, 0): (256, 4, 2),
+            (False, 1): (256, 4, 1),
+            (True, 0): (256, 4, 3),
+            (True, 1): (256, 4, 1),
+            (True, 3): (256, 4, 2),
+        },
+        "slice_fwd_g": {
+            (False, 0): (128, 4, 3),
+            (False, 1): (256, 4, 1),
+            (True, 0): (128, 4, 3),
+            (True, 1): (256, 4, 1),
+            (True, 3): (256, 4, 3),
+        },
+        "deslice_fwd_n": {
+            (False, 0): (256, 4, 3),
+            (False, 1): (128, 4, 1),
+            (True, 0): (128, 4, 2),
+            (True, 1): (128, 4, 1),
+            (True, 3): (128, 4, 1),
+        },
+        "deslice_fwd_online": {
+            (False, 0): (256, 4, 1),
+            (False, 1): (128, 4, 1),
+            (True, 0): (128, 4, 2),
+            (True, 1): (128, 4, 1),
+            (True, 3): (64, 4, 1),
+        },
+        "slice_bwd_n": {
+            (False, 0): (128, 4, 2),
+            (False, 1): (64, 4, 1),
+            (True, 0): (128, 4, 2),
+            (True, 1): (128, 4, 1),
+            (True, 3): (64, 4, 1),
+        },
+        "slice_bwd_g": {
+            (False, 0): (256, 8, 1),
+            (False, 1): (256, 4, 1),
+            (True, 0): (128, 4, 3),
+            (True, 1): (128, 4, 1),
+            (True, 3): (256, 4, 3),
+        },
+        "deslice_bwd_n": {
+            (False, 0): (128, 4, 2),
+            (False, 1): (128, 4, 1),
+            (True, 0): (128, 4, 2),
+            (True, 1): (128, 4, 1),
+            (True, 3): (64, 4, 1),
+        },
+        "deslice_bwd_g": {
+            (False, 0): (128, 4, 1),
+            (False, 1): (128, 4, 1),
+            (True, 0): (128, 4, 3),
+            (True, 1): (128, 4, 1),
+            (True, 3): (256, 4, 3),
+        },
+    },
+    (64, 32): {
+        "stats": {
+            (False, 0): (128, 4, 3),
+            (False, 1): (128, 4, 1),
+            (True, 0): (256, 4, 3),
+            (True, 1): (128, 4, 1),
+            (True, 3): (256, 4, 1),
+        },
+        "slice_fwd_g": {
+            (False, 0): (256, 8, 3),
+            (False, 1): (128, 4, 1),
+            (True, 0): (128, 4, 1),
+            (True, 1): (128, 4, 1),
+            (True, 3): (256, 4, 2),
+        },
+        "deslice_fwd_n": {
+            (False, 0): (128, 4, 3),
+            (False, 1): (256, 8, 1),
+            (True, 0): (256, 8, 2),
+            (True, 1): (128, 4, 1),
+            (True, 3): (128, 4, 1),
+        },
+        "deslice_fwd_online": {
+            (False, 0): (128, 4, 3),
+            (False, 1): (128, 4, 1),
+            (True, 0): (128, 4, 3),
+            (True, 1): (128, 4, 1),
+            (True, 3): (128, 4, 2),
+        },
+        "slice_bwd_n": {
+            (False, 0): (64, 4, 2),
+            (False, 1): (64, 4, 1),
+            (True, 0): (256, 8, 3),
+            (True, 1): (64, 4, 1),
+            (True, 3): (128, 4, 1),
+        },
+        "slice_bwd_g": {
+            (False, 0): (128, 4, 1),
+            (False, 1): (128, 4, 1),
+            (True, 0): (128, 4, 1),
+            (True, 1): (128, 4, 1),
+            (True, 3): (128, 4, 3),
+        },
+        "deslice_bwd_n": {
+            (False, 0): (64, 4, 3),
+            (False, 1): (64, 4, 1),
+            (True, 0): (64, 4, 2),
+            (True, 1): (64, 4, 1),
+            (True, 3): (64, 4, 1),
+        },
+        "deslice_bwd_g": {
+            (False, 0): (64, 4, 1),
+            (False, 1): (128, 4, 1),
+            (True, 0): (64, 4, 1),
+            (True, 1): (64, 4, 1),
+            (True, 3): (128, 4, 3),
+        },
+    },
+    (64, 64, 32): {
+        "stats": {
+            (True, 3): (256, 4, 1),
+        },
+        "slice_fwd_g": {
+            (True, 3): (64, 4, 1),
+        },
+        "deslice_fwd_n": {
+            (True, 3): (256, 4, 3),
+        },
+        "deslice_fwd_online": {
+            (True, 3): (256, 4, 1),
+        },
+        "slice_bwd_n": {
+            (True, 3): (64, 4, 1),
+        },
+        "slice_bwd_g": {
+            (True, 3): (128, 4, 2),
+        },
+        "deslice_bwd_n": {
+            (True, 3): (64, 4, 1),
+        },
+        "deslice_bwd_g": {
+            (True, 3): (128, 4, 2),
+        },
+    },
+}
+
+
 def _cfg_blk(kernel, is16, dot, gb, dt, dvt=None, device=None):
     # (G_block, D_tile, DV_tile) first -- the value width sets the shape of
     # the value accumulators -- then (G_block, D_tile) for any value width.
-    table = _CFG_BLK_ADA if tile_table(device) == "ada" else _CFG_BLK
+    if tile_table(device) == "ada":
+        table = _CFG_BLK_ADA
+    else:
+        table = _CFG_BLK_T36 if _hopper_series() == "3.6" else _CFG_BLK
     entry = {}
     for key in ((gb, dt, dvt), (gb, dt)):
         entry = table.get(key, {}).get(kernel)

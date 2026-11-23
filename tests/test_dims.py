@@ -174,8 +174,10 @@ def test_cfg_blk_prefers_value_width_entry():
     wins over the borrowed single-tile table."""
     from flashslice.kernels import blocked as fb
 
-    # table logic, not tuning: pin the Hopper table whatever the GPU
+    # table logic, not tuning: pin the Hopper table whatever the GPU, and the
+    # Triton 3.0 series (the table these lines edit) whatever the Triton
     fb.set_tile_table("hopper")
+    fb.set_tile_series("3.0")
     saved = dict(fb._CFG_BLK)
     try:
         fb._CFG_BLK[(32, 64)] = {"deslice_fwd_n": {(True, 3): (128, 4, 2)}}
@@ -189,6 +191,7 @@ def test_cfg_blk_prefers_value_width_entry():
         fb._CFG_BLK.clear()
         fb._CFG_BLK.update(saved)
         fb.set_tile_table("auto")
+        fb.set_tile_series("auto")
 
 
 def test_launch_cfg_per_kernel_block():
@@ -196,8 +199,10 @@ def test_launch_cfg_per_kernel_block():
     one keeps the family default."""
     from flashslice.kernels import blocked as fb
 
-    # table logic, not tuning: pin the Hopper table whatever the GPU
+    # table logic, not tuning: pin the Hopper table whatever the GPU, and the
+    # Triton 3.0 series (the table these lines edit) whatever the Triton
     fb.set_tile_table("hopper")
+    fb.set_tile_series("3.0")
     saved = dict(fb._CFG_BLK)
     t = torch.empty(1, 8, 4, 56, dtype=torch.bfloat16)
     try:
@@ -209,6 +214,7 @@ def test_launch_cfg_per_kernel_block():
         fb._CFG_BLK.clear()
         fb._CFG_BLK.update(saved)
         fb.set_tile_table("auto")
+        fb.set_tile_series("auto")
 
 
 def test_stats_mode_switch():

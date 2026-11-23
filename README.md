@@ -57,8 +57,18 @@ cd flashslice && pip install -e .
 
 Requirements: Python ≥ 3.9, PyTorch ≥ 2.4, Triton ≥ 3.0 and an NVIDIA GPU.
 Measurements were taken on two GPUs: an NVIDIA GH200 with PyTorch 2.5 and
-Triton 3.0 (the paper's numbers), and an NVIDIA RTX 4090 with PyTorch 2.8
-and Triton 3.4.
+Triton 3.0 (the paper's numbers) and again with PyTorch 2.11 and Triton 3.6,
+and an NVIDIA RTX 4090 with PyTorch 2.8 and Triton 3.4.
+
+> **Triton versions.** The winning tiles also depend on the Triton that
+> compiles the kernels: with the Triton 3.0 tiles, the default `ieee` kernels
+> run 2× to 9× behind their best under Triton 3.6, slower than eager. The
+> Hopper class therefore has one set of tables for Triton 3.0 and one for
+> Triton 3.6 and newer, chosen from the installed Triton
+> (`flashslice.kernels.tile_series()`; `set_tile_series(...)` or
+> `FLASHSLICE_TILE_SERIES` forces one). Triton 3.1 to 3.5 are untested on
+> Hopper and run on the 3.0 set with a warning. The Ada table was swept under
+> Triton 3.4 and has one set.
 
 > **Supported GPUs.** Tile configurations are tuned per GPU class and
 > picked automatically from the device's shared memory per block: a Hopper
@@ -195,6 +205,40 @@ kernels with per-sample weights, slice-first order, lands at 2.8–3.4×
 eager's error against the 2× gate (relative error ~2×10⁻⁵), with either tile
 table, so it is a numerics difference of this GPU and Triton version rather
 than a tiling one.
+
+**On the GH200 under Triton 3.6** (torch 2.11, the Triton 3.6 tile set), one
+layer (`H=8`, `D=32`), training step, beside the same measurement under torch
+2.5 / Triton 3.0; `N = 1M` unless given, eager → FlashSlice:
+
+| *G*, input, dot mode | torch 2.5 / Triton 3.0 | torch 2.11 / Triton 3.6 |
+| --- | --- | --- |
+| 32, fp32, `ieee`, *N* = 4.2M | 232 → 115 ms (2.02×) | 216 → 125 ms (1.74×) |
+| 32, bf16, `ieee`, *N* = 4.2M | 181 → 110 ms (1.64×) | 130 → 109 ms (1.20×) |
+| 32, fp32, `tf32`, *N* = 4.2M | 233 → 99 ms (2.35×) | 217 → 91 ms (2.38×) |
+| 32, bf16, `bf16`, *N* = 4.2M | 181 → 59 ms (3.08×) | 130 → 51 ms (2.54×) |
+| 16, fp32, `ieee` | 46 → 21 ms (2.16×) | 47 → 21 ms (2.20×) |
+| 64, fp32, `ieee` | 85 → 41 ms (2.07×) | 64 → 48 ms (1.34×) |
+| 128, fp32, `ieee` | 151 → 67 ms (2.26×) | 104 → 74 ms (1.41×) |
+| 64, bf16, `bf16` | 78 → 18 ms (4.44×) | 47 → 15 ms (3.27×) |
+| 128, bf16, `bf16` | 151 → 28 ms (5.30×) | 91 → 21 ms (4.32×) |
+| 256, fp32, `ieee` | 282 → 195 ms (1.45×) | 176 → 194 ms (0.91×) |
+| 256, bf16, `ieee` | 294 → 214 ms (1.37×) | 170 → 195 ms (0.87×) |
+| 256, bf16, `bf16` | 294 → 41 ms (7.16×) | 170 → 30 ms (5.72×) |
+
+The fused layer takes about the same time under both: the `ieee` kernels are
+up to 16% slower under Triton 3.6 at their best tiles, the tensor-core modes
+8% to 28% faster. Eager is itself faster under torch 2.11, by 7% at `G=32` in
+fp32 and by up to 42% at `G=256`, so the speedups are smaller; at `G=256` the
+`ieee` path no longer beats eager in time, while it still holds 86% less
+memory and the `bf16` dot mode is 5.7× faster. Memory is the same under both.
+With the wrong set the loss is large either way: the Triton 3.0 tiles under
+Triton 3.6 put the `G=32` fp32 layer at 0.54× of eager, and the 3.6 tiles
+under Triton 3.0 at 1.00×. Every case of `bench/parity_test.py` passes under
+both. One check of `bench/parity_ops.py` does not pass under torch 2.11: the
+temperature gradient of the blocked kernels at `G=2048` lands at 2.1× eager's
+error against the 2× gate. The fused error is the same under both stacks
+(5.7×10⁻⁵); eager's own is smaller under torch 2.11 (2.7×10⁻⁵ against
+3.6×10⁻⁵).
 
 <details>
 <summary><b>Kernels as the coupling of another model</b></summary>

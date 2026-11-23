@@ -1,5 +1,22 @@
 # Changelog
 
+## Unreleased
+
+- **Hopper tile tables per Triton series.** The Hopper tables were swept
+  under Triton 3.0; under Triton 3.6 (torch 2.11) they put the default `ieee`
+  kernels 2x to 9x behind their best, slower than eager. Triton 3.6 and newer
+  now take a set of their own on Hopper (single-tile `G = 16-128` at the ieee,
+  tf32-class and bf16 levels; blocked `(32, 32)`, `(64, 32)`, `(64, 64, 32)`),
+  swept on a GH200; `tile_series()` reports the series, `set_tile_series` /
+  `FLASHSLICE_TILE_SERIES` force one. The Triton 3.0 set and the Ada tables
+  are untouched. Triton 3.1 to 3.5 on Hopper run on the 3.0 set with a
+  warning. Numbers under both stacks are in the README.
+- **`bench/replay_tiles.py`** replays the layer's own backward call at every
+  tile of one blocked kernel. `bench_kernels.py` hands the blocked deslice
+  backward fp32 tokens, the layer under bf16 autocast hands it bf16 ones, and
+  Triton compiles the two apart: under Triton 3.6 the sweep's winner for that
+  kernel was four times slower inside a training step than in the sweep.
+
 ## v0.3.0 — 2026-09-29
 
 First full release on PyPI (0.0.1 was a placeholder), with the paper on

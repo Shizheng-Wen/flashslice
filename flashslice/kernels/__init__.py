@@ -50,10 +50,13 @@ from .slice_ops import (
     set_kernel_mode,
     set_tile_table,
     tile_table,
+    set_tile_series,
+    tile_series,
 )
 from . import blocked  # noqa: F401  — registers the flashslice::*_blk ops
 from .blocked import set_block_g, set_stats_mode, stats_mode
 
 __all__ = ["fused_slice", "fused_deslice", "unsupported_dims", "single_tile_dims",
            "set_dot_mode", "set_kernel_mode", "set_block_g", "set_stats_mode",
-           "stats_mode", "set_tile_table", "tile_table"]
+           "stats_mode", "set_tile_table", "tile_table", "set_tile_series",
+           "tile_series"]

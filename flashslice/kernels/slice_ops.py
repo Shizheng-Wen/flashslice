@@ -36,7 +36,8 @@ Layout: kernels read x_mid / fx_mid in the natural GEMM output layout
 (B, N, H, D) via strides — the eager permute+contiguous copies disappear.
 Shapes: the kernels in this file hold D and G whole, one tile each, so they
 serve D and G that are powers of two in [16, 128] (paper: D=32, G=32); tiles
-are tuned per G (``_CFG``). Every other shape — any G, D up to 256 — goes to
+are tuned per G, per GPU class and, on Hopper, per Triton series (``_CFG``,
+``tile_table``, ``tile_series``). Every other shape — any G, D up to 256 — goes to
 the G-blocked kernels in ``blocked.py`` (``_use_blocked`` routes; ``set_kernel_mode``
 or ``FLASHSLICE_KERNEL_MODE`` forces one path). D above 256 is refused by
 ``unsupported_dims``, and ``Physics_Attention_Irregular_Mesh`` then warns and
@@ -44,6 +45,8 @@ runs the eager path instead.
 """
 
 import os
+import re
+import warnings
 
 import torch
 import triton
@@ -302,6 +305,188 @@ def tile_table(device=None):
     return _TILE_CLASS[idx]
 
 
+# Tile tables per Triton series, on the Hopper class. The winning tile also
+# depends on the Triton that compiles the kernel. The Hopper tables above
+# (_CFG, _CFG_BF16) were swept under Triton 3.0 (torch 2.5); under Triton 3.6
+# (torch 2.11) the ieee kernels run 2.4x to 8.9x behind their best with them
+# over the four kernels of a shape (one deslice_bwd 11x), which made the fused
+# layer slower than eager. The reverse holds too: the tiles below cost 2-2.8x
+# under Triton 3.0. So Triton 3.6 has its own Hopper set, swept 2026-11-23 on
+# one GH200 with bench_kernels.py at N = 262k and 1M, same winner rule (jobs
+# 4012017-24, 4012176-77). The Ada tables were swept under Triton 3.4 and
+# have one set.
+_CFG_T36 = {
+    16: {
+        ("slice_fwd", False): (256, 4, 2),
+        ("slice_fwd", True): (128, 4, 2),
+        ("deslice_fwd", False): (256, 4, 1),
+        ("deslice_fwd", True): (256, 4, 1),
+        ("slice_bwd", False): (256, 4, 1),
+        ("slice_bwd", True): (256, 4, 1),
+        ("deslice_bwd", False): (128, 4, 1),
+        ("deslice_bwd", True): (128, 4, 3),
+    },
+    32: {
+        ("slice_fwd", False): (128, 4, 3),
+        ("slice_fwd", True): (128, 4, 3),
+        ("deslice_fwd", False): (256, 4, 2),
+        ("deslice_fwd", True): (256, 4, 1),
+        ("slice_bwd", False): (128, 4, 1),
+        ("slice_bwd", True): (128, 4, 3),
+        ("deslice_bwd", False): (128, 8, 1),
+        ("deslice_bwd", True): (128, 4, 2),
+    },
+    64: {
+        ("slice_fwd", False): (128, 4, 1),
+        ("slice_fwd", True): (128, 4, 3),
+        ("deslice_fwd", False): (128, 8, 2),
+        ("deslice_fwd", True): (128, 8, 2),
+        ("slice_bwd", False): (128, 8, 1),
+        ("slice_bwd", True): (64, 4, 3),
+        ("deslice_bwd", False): (16, 4, 3),
+        ("deslice_bwd", True): (128, 8, 2),
+    },
+    128: {
+        ("slice_fwd", False): (64, 4, 3),
+        ("slice_fwd", True): (64, 4, 3),
+        ("deslice_fwd", False): (64, 8, 3),
+        ("deslice_fwd", True): (64, 8, 1),
+        ("slice_bwd", False): (32, 4, 1),
+        ("slice_bwd", True): (32, 4, 2),
+        ("deslice_bwd", False): (32, 4, 1),
+        ("deslice_bwd", True): (32, 4, 2),
+    },
+}
+
+
+# Triton 3.6, Hopper: the tensor-core value-dot levels (tf32, bf16v, tf32x3)
+# have their own winners; under Triton 3.0 they share _CFG. Picked from the
+# tf32 sweep among the configurations the launch code lets through (one
+# stage, and 4 warps on the backward kernels and at G = 16).
+_CFG_TC_T36 = {
+    16: {
+        ("slice_fwd", False): (256, 4, 1),
+        ("slice_fwd", True): (256, 4, 1),
+        ("deslice_fwd", False): (64, 4, 1),
+        ("deslice_fwd", True): (256, 4, 1),
+        ("slice_bwd", False): (128, 4, 1),
+        ("slice_bwd", True): (128, 4, 1),
+        ("deslice_bwd", False): (128, 4, 1),
+        ("deslice_bwd", True): (128, 4, 1),
+    },
+    32: {
+        ("slice_fwd", False): (256, 4, 1),
+        ("slice_fwd", True): (256, 4, 1),
+        ("deslice_fwd", False): (256, 4, 1),
+        ("deslice_fwd", True): (256, 4, 1),
+        ("slice_bwd", False): (128, 4, 1),
+        ("slice_bwd", True): (128, 4, 1),
+        ("deslice_bwd", False): (128, 4, 1),
+        ("deslice_bwd", True): (128, 4, 1),
+    },
+    64: {
+        ("slice_fwd", False): (128, 4, 1),
+        ("slice_fwd", True): (128, 4, 1),
+        ("deslice_fwd", False): (64, 4, 1),
+        ("deslice_fwd", True): (128, 4, 1),
+        ("slice_bwd", False): (64, 4, 1),
+        ("slice_bwd", True): (64, 4, 1),
+        ("deslice_bwd", False): (64, 4, 1),
+        ("deslice_bwd", True): (64, 4, 1),
+    },
+    128: {
+        ("slice_fwd", False): (64, 4, 1),
+        ("slice_fwd", True): (64, 4, 1),
+        ("deslice_fwd", False): (128, 8, 1),
+        ("deslice_fwd", True): (128, 8, 1),
+        ("slice_bwd", False): (16, 4, 1),
+        ("slice_bwd", True): (32, 4, 1),
+        ("deslice_bwd", False): (64, 4, 1),
+        ("deslice_bwd", True): (16, 4, 1),
+    },
+}
+
+
+# Triton 3.6, Hopper: the bf16-dot (level 3) winners, 4 warps on the backward
+# kernels.
+_CFG_BF16_T36 = {
+    16: {
+        "slice_fwd": (128, 4, 2),
+        "deslice_fwd": (256, 4, 1),
+        "slice_bwd": (128, 4, 3),
+        "deslice_bwd": (128, 4, 3),
+    },
+    32: {
+        "slice_fwd": (256, 4, 3),
+        "deslice_fwd": (256, 4, 3),
+        "slice_bwd": (64, 4, 3),
+        "deslice_bwd": (64, 4, 3),
+    },
+    64: {
+        "slice_fwd": (128, 4, 3),
+        "deslice_fwd": (128, 8, 2),
+        "slice_bwd": (64, 4, 3),
+        "deslice_bwd": (64, 4, 3),
+    },
+    128: {
+        "slice_fwd": (128, 4, 3),
+        "deslice_fwd": (128, 8, 3),
+        "slice_bwd": (16, 4, 3),
+        "deslice_bwd": (16, 4, 3),
+    },
+}
+
+
+_TILE_SERIES_ALL = ("3.0", "3.6")
+_TILE_SERIES = os.environ.get("FLASHSLICE_TILE_SERIES", "") or "auto"
+_SERIES_WARNED = False
+
+
+def set_tile_series(name):
+    """'auto' (default), '3.0' or '3.6' -- overrides FLASHSLICE_TILE_SERIES.
+    'auto' follows the installed Triton; forcing a series is for timing
+    comparisons."""
+    global _TILE_SERIES
+    if name not in ("auto",) + _TILE_SERIES_ALL:
+        raise ValueError("tile series must be 'auto', '3.0' or '3.6', got %r"
+                         % (name,))
+    _TILE_SERIES = name
+
+
+def tile_series(version=None):
+    """The Hopper tile-table series for a Triton version (default: the series
+    in use): ``"3.0"`` or ``"3.6"``.
+
+    A table from the wrong series is not a small loss (2x to 9x on the ieee
+    kernels, either way). Triton 3.6 and newer take the 3.6 tables, older
+    ones the 3.0 tables; 3.1 to 3.5 and anything newer than 3.6 are untested
+    on Hopper. Compare the two with ``python bench/bench_kernels.py
+    --defaults-only`` under ``FLASHSLICE_TILE_SERIES=3.0`` and ``=3.6``."""
+    if version is None:
+        if _TILE_SERIES != "auto":
+            return _TILE_SERIES
+        version = triton.__version__
+    m = re.match(r"(\d+)\.(\d+)", version)
+    mm = (int(m.group(1)), int(m.group(2))) if m else (3, 0)
+    return "3.6" if mm >= (3, 6) else "3.0"
+
+
+def _hopper_series():
+    """tile_series() for a Hopper lookup; warns once when the installed Triton
+    has no swept set of its own and none was forced."""
+    global _SERIES_WARNED
+    if (_TILE_SERIES == "auto" and not _SERIES_WARNED
+            and not triton.__version__.startswith(tuple(v + "." for v in _TILE_SERIES_ALL))):
+        _SERIES_WARNED = True
+        warnings.warn(
+            "flashslice: the Hopper tile tables are tuned for Triton 3.0 and 3.6; "
+            "this is Triton %s, which takes the %s tables untested. Check with "
+            "`python bench/bench_kernels.py --defaults-only`, and try the other "
+            "series with FLASHSLICE_TILE_SERIES." % (triton.__version__, tile_series()),
+            stacklevel=3)
+    return tile_series()
+
+
 def _cfg(name, t, dot=0, g=32, d=32):
     if tile_table(t.device) == "ada" and dot in (1, 2, 4):
         # tf32-class dots hold fp32 MMA operands: on Ada their own tiles,
@@ -311,6 +496,14 @@ def _cfg(name, t, dot=0, g=32, d=32):
     elif tile_table(t.device) == "ada":
         table = _CFG_BF16_ADA if dot == 3 else _CFG_ADA
         key = name if dot == 3 else (name, t.dtype != torch.float32)
+    elif _hopper_series() == "3.6":
+        is16 = t.dtype != torch.float32
+        if dot == 3:
+            table, key = _CFG_BF16_T36, name
+        elif dot:
+            table, key = _CFG_TC_T36, (name, is16)
+        else:
+            table, key = _CFG_T36, (name, is16)
     else:
         table = _CFG_BF16 if dot == 3 else _CFG
         key = name if dot == 3 else (name, t.dtype != torch.float32)
