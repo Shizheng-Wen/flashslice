@@ -16,6 +16,10 @@
   backward fp32 tokens, the layer under bf16 autocast hands it bf16 ones, and
   Triton compiles the two apart: under Triton 3.6 the sweep's winner for that
   kernel was four times slower inside a training step than in the sweep.
+- **Fix: `tile_table()` under torch 2.5.** v0.3.0 read the device's shared
+  memory per block from a property that torch 2.5 does not have, so every
+  fused call raised `AttributeError` there. Where the property is missing the
+  class now follows the compute capability (9.x and newer: Hopper).
 
 ## v0.3.0 — 2026-09-29
 

@@ -246,8 +246,10 @@ def test_tile_table_selection():
     finally:
         set_tile_table("auto")
     if torch.cuda.is_available():
-        smem = torch.cuda.get_device_properties(0).shared_memory_per_block_optin
-        assert tile_table(0) == ("hopper" if smem >= fs._HOPPER_SMEM else "ada")
+        props = torch.cuda.get_device_properties(0)
+        smem = getattr(props, "shared_memory_per_block_optin", None)   # absent in torch 2.5
+        hopper = props.major >= 9 if smem is None else smem >= fs._HOPPER_SMEM
+        assert tile_table(0) == ("hopper" if hopper else "ada")
     # every Ada single-tile entry must exist for each G the Hopper table has
     assert set(fs._CFG_ADA) == set(fs._CFG) and set(fs._CFG_BF16_ADA) == set(fs._CFG_BF16)
     for g in fs._CFG:

@@ -300,9 +300,19 @@ def tile_table(device=None):
     if idx is None:
         idx = torch.cuda.current_device()
     if idx not in _TILE_CLASS:
-        smem = torch.cuda.get_device_properties(idx).shared_memory_per_block_optin
-        _TILE_CLASS[idx] = "hopper" if smem >= _HOPPER_SMEM else "ada"
+        _TILE_CLASS[idx] = "hopper" if _has_hopper_smem(idx) else "ada"
     return _TILE_CLASS[idx]
+
+
+def _has_hopper_smem(idx):
+    """Whether device ``idx`` has Hopper's shared memory per block. Older torch
+    builds (2.5 among them) do not report it; there the compute capability
+    decides: 9.x and newer have 227 KB, everything before has less."""
+    props = torch.cuda.get_device_properties(idx)
+    smem = getattr(props, "shared_memory_per_block_optin", None)
+    if smem is None:
+        return props.major >= 9
+    return smem >= _HOPPER_SMEM
 
 
 # Tile tables per Triton series, on the Hopper class. The winning tile also
